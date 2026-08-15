@@ -1,0 +1,41 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+numpy==1.25.0
+opencv-python<4.10   # 4.10+ requires numpy>=2
+plyfile<1.1          # 1.1+ requires numpy>=2
+
+# --- AnySplat's Python dependencies ---
+wheel
+tqdm
+lightning
+black
+ruff
+hydra-core
+jaxtyping
+beartype
+wandb
+einops
+colorama
+scikit-image
+colorspacious
+matplotlib
+moviepy==1.0.3
+imageio
+timm
+dacite
+lpips
+e3nn
+tabulate
+svg.py
+scikit-video
+Pillow
+huggingface_hub
+gradio
+xformers==0.0.24
+pydantic
+open3d
+safetensors
+https://github.com/nerfstudio-project/gsplat/releases/download/v1.4.0/gsplat-1.4.0+pt22cu121-cp310-cp310-linux_x86_64.whl
+
+# This project's specific deps
+gin-config
+
