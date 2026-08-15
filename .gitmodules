@@ -1,0 +1,9 @@
+[submodule "anyprune/models/SplatFormer"]
+	path = anyprune/models/SplatFormer
+	url = https://github.com/ChenYutongTHU/SplatFormer.git
+[submodule "anyprune/models/AnySplat"]
+	path = anyprune/models/AnySplat
+	url = https://github.com/InternRobotics/AnySplat.git
+[submodule "anyprune/models/YoNoSplat"]
+	path = anyprune/models/YoNoSplat
+	url = https://github.com/cvg/YoNoSplat.git
