@@ -1,6 +1,9 @@
+# Miscellaneous
+.vscode
 .env
 NOTES.md
 
+# Caches
 __pycache__/
 .cache/
 .ruff_cache
