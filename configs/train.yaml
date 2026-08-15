@@ -1,0 +1,6 @@
+defaults:
+  - base
+  - machine: ???
+  - _self_
+
+model: splatformer

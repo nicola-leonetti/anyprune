@@ -1,0 +1,5 @@
+# Base configuration shared by all the others (e.g. train, eval)
+seed: 42
+
+checkpoints_dir: /home/nicola/Desktop/anyprune/checkpoints
+cache_dir: /home/nicola/Desktop/anyprune/cache
