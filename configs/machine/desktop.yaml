@@ -1,1 +1,5 @@
-name: desktop
+# @package _global_
+machine_name: desktop
+
+dl3dv_root_dir: /home/nicola/Desktop/Anysplat-improved/datasets/dl3dv
+dl3dv_images_subdir: images_8

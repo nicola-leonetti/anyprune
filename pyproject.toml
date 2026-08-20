@@ -1,0 +1,6 @@
+[project]
+name = "anyprune"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+include = ["anyprune*"]

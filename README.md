@@ -40,6 +40,11 @@ grep -ivE '^[[:space:]]*spconv' anyprune/models/SplatFormer/requirements.txt | p
 pip install -r requirements.txt
 ```
 
+Finally, install the Anyprune package  with:
+```bash
+pip install -e .
+```
+
 ### Setting a Wandb API key
 If you wish to use Wandb, it is suggested that you provide your API key
 in a `.env` file. To do that, run:

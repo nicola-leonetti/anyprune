@@ -1,5 +1,7 @@
 # Base configuration shared by all the others (e.g. train, eval)
 seed: 42
 
+anysplat_checkpoint: lhjiang/anysplat
+
 checkpoints_dir: /home/nicola/Desktop/anyprune/checkpoints
 cache_dir: /home/nicola/Desktop/anyprune/cache

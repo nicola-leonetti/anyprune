@@ -3,8 +3,16 @@
 .env
 NOTES.md
 
-# Caches
+# Python-related
 __pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
 .cache/
 .ruff_cache
 
