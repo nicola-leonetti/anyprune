@@ -1,7 +1,7 @@
 """
 Implementation of the DL3DV dataset.
 
-This dataset's directory structure is 
+This dataset's directory structure is
     <root>
     |   <scene_1_hash>
     |   |   <img_subdir>
@@ -15,14 +15,28 @@ This dataset's directory structure is
 import json
 import os
 from functools import lru_cache
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from pathlib import Path
+from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
 from anyprune import process_image
+
+
+# Side of the square images process_image() returns.
+PROCESSED_IMAGE_SIZE = 448
+
+
+@lru_cache(maxsize=None)
+def _read_transforms_json(scene_dir: str) -> Dict[str, Any]:
+    """
+    Given the path of a scene directory, parse its transforms.json.
+    """
+    with open(Path(scene_dir) / "transforms.json") as f:
+        return json.load(f)
 
 
 @lru_cache(maxsize=None)
@@ -31,8 +45,7 @@ def _read_poses(scene_dir: str) -> Tensor:
     Given the path of a scene directory, return a (V, 1, 4, 4) tensor
     with the poses of all the frames in the scene.
     """
-    with open(Path(scene_dir) / "transforms.json") as f: 
-        data = json.load(f)
+    data = _read_transforms_json(scene_dir)
     poses = [frame["transform_matrix"] for frame in data["frames"]]
     poses = torch.tensor(poses, dtype=torch.float32).unsqueeze(1)
     return poses # (V, 1, 4, 4)
@@ -41,21 +54,80 @@ def _read_poses(scene_dir: str) -> Tensor:
 @lru_cache(maxsize=None)
 def _read_img_paths(scene_dir: str, img_subdir: str) -> List[str]:
     """
-    Given the path of a scene directory and an image directory, return 
+    Given the path of a scene directory and an image directory, return
     an ordered list of the paths of the images.
     """
-    with open(Path(scene_dir) / "transforms.json") as f: 
-        data = json.load(f)
+    data = _read_transforms_json(scene_dir)
     return tuple(
         Path(scene_dir) / img_subdir / Path(frame["file_path"]).name
         for frame in data["frames"]
     )
 
 
+def _rescale_axis(
+    focal: float, 
+    principal: float, 
+    scale: float
+) -> Tuple[float, float]:
+    """
+    Rescale one axis of a pinhole intrinsic by 'scale'.
+    """
+    # Pixel centers sit at integer coordinates plus a half
+    return focal * scale, (principal + 0.5) * scale - 0.5
+
+
+@lru_cache(maxsize=None)
+def _read_intrinsics(scene_dir: str, img_subdir: str) -> Tensor:
+    """
+    Given the path of a scene directory and an image directory, return a
+    (V, 1, 3, 3) tensor with the pinhole intrinsics of every frame, in
+    pixels of the images that _read_image_info() returns.
+
+    DL3DV stores a single camera per scene, calibrated for the original
+    full-resolution capture ("w" and "h" in transforms.json). 
+    Those intrinsics are then changed with the two transformations the 
+    frames go through before we see them:
+    - the downscaling to the resolution of the copy on disk in 
+        img_subdir.
+    - the resize plus center crop in process_image().
+    """
+    data = _read_transforms_json(scene_dir)
+    img_paths = _read_img_paths(scene_dir, img_subdir)
+
+    fx, fy = data["fl_x"], data["fl_y"]
+    cx, cy = data["cx"], data["cy"]
+
+    # Original capture resolution -> the downscaled copy on disk
+    with Image.open(img_paths[0]) as img:
+        disk_w, disk_h = img.size
+    fx, cx = _rescale_axis(fx, cx, disk_w / data["w"])
+    fy, cy = _rescale_axis(fy, cy, disk_h / data["h"])
+
+    # The copy on disk -> process_image()'s resize to a short edge of
+    # PROCESSED_IMAGE_SIZE, followed by a center crop to a square
+    if disk_w > disk_h:
+        resized_h = PROCESSED_IMAGE_SIZE
+        resized_w = int(disk_w * (PROCESSED_IMAGE_SIZE / disk_h))
+    else:
+        resized_w = PROCESSED_IMAGE_SIZE
+        resized_h = int(disk_h * (PROCESSED_IMAGE_SIZE / disk_w))
+    fx, cx = _rescale_axis(fx, cx, resized_w / disk_w)
+    fy, cy = _rescale_axis(fy, cy, resized_h / disk_h)
+    cx -= (resized_w - PROCESSED_IMAGE_SIZE) // 2
+    cy -= (resized_h - PROCESSED_IMAGE_SIZE) // 2
+
+    intrinsics = torch.tensor(
+        [[fx, 0.0, cx],
+         [0.0, fy, cy],
+         [0.0, 0.0, 1.0]], dtype=torch.float32
+    )
+    return intrinsics.expand(len(img_paths), 1, 3, 3).contiguous() # (V, 1, 3, 3)
+
+
 def _read_image_info(scene_dir: str, img_subdir: str) -> Tensor:
     """
-    Given the directory of a scene and the img_subdir subfolder 
-    containing the frames, reads the images in the directory to get a 
+    Given the directory of a scene and the img_subdir subfolder
+    containing the frames, reads the images in the directory to get a
     (V, 3, H, W) tensor with all the frames.
     """
     img_paths = _read_img_paths(scene_dir, img_subdir)
@@ -73,28 +145,38 @@ class DL3DVDataset(Dataset):
         # Cache the absolute path of all scenes
         self.scenes = [
             os.path.join(root, dir_name)
-            for dir_name in sorted(os.listdir(root)) 
+            for dir_name in sorted(os.listdir(root))
             if os.path.isdir(os.path.join(root, dir_name))
         ]
-            
+
     def __len__(self):
         return len(self.scenes)
 
     def __getitem__(self, idx):
         """
-        Returns {images: images, poses: poses}
+        Returns {images: images, poses: poses, intrinsics: intrinsics}
 
         Images is a (V, 3, H, W) tensor with all images in the scene of
         index idx, normalized to be in [0, 1].
 
-        Poses is a (V, 1, 4, 4) tensor containing the poses of each 
-        image.
+        Poses is a (V, 1, 4, 4) tensor containing the poses of each
+        image, as camera-to-world matrices with OpenGL camera axes. See
+        Gaussians.rasterize() for the full convention.
+
+        Intrinsics is a (V, 1, 3, 3) tensor of pinhole camera matrices, 
+        expressed in terms of pixels of the corresponding image returned
+        by this method.
         """
         scene_path = self.scenes[idx]
         images = _read_image_info(scene_path, self.img_subdir)
         poses =  _read_poses(scene_path)
+        intrinsics = _read_intrinsics(scene_path, self.img_subdir)
+        assert images.shape[-2:] == (PROCESSED_IMAGE_SIZE, PROCESSED_IMAGE_SIZE), (
+            f"Intrinsics are computed for {PROCESSED_IMAGE_SIZE}x{PROCESSED_IMAGE_SIZE} "
+            f"images, but the frames are {tuple(images.shape[-2:])}"
+        )
         return {
-            "images": images, # (V, 3, H, W)
-            "poses": poses,   # (V, 1, 4, 4)
+            "images": images,         # (V, 3, H, W)
+            "poses": poses,           # (V, 1, 4, 4)
+            "intrinsics": intrinsics, # (V, 1, 3, 3)
         }
-         
