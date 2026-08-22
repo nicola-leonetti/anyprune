@@ -10,5 +10,5 @@ from src.model.model import AnySplat
 
 
 __all__ = [
-    "AnySplat"
+    "AnySplat",
 ]

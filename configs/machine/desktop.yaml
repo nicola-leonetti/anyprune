@@ -1,5 +1,8 @@
 # @package _global_
 machine_name: desktop
 
+checkpoints_dir: /home/nicola/Desktop/anyprune/checkpoints
+cache_dir: /home/nicola/Desktop/anyprune/cache
+
 dl3dv_root_dir: /home/nicola/Desktop/Anysplat-improved/datasets/dl3dv
 dl3dv_images_subdir: images_8

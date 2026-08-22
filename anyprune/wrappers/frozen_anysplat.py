@@ -8,6 +8,7 @@ from torch import Tensor
 
 from anyprune.utils import _muted
 with _muted(True): from ..models import AnySplat
+from ..gaussians import Gaussians
 
 
 class FrozenAnySplat(nn.Module):
@@ -21,8 +22,8 @@ class FrozenAnySplat(nn.Module):
 
     def forward(self, context_images: Tensor):
         """
-        Takes a (V, 3, H, W) tensor of images and returns a tuple 
-        (gaussians, poses).
+        Takes a (V, 3, H, W) tensor of images and returns a tuple
+        (poses, gaussians).
         """
         assert context_images.shape[1] == 3, f"Expected (V, 3, H, W) shape for context images, got {context_images.shape}"
         assert context_images.dim() == 4, f"context_images should have dim 4, got {context_images.dim()}"
@@ -30,6 +31,6 @@ class FrozenAnySplat(nn.Module):
             encoder_output = self.model.encoder(
                 context_images, global_step=0, visualization_dump=None
             )
-        poses = enc_out.pred_context_pose
-        gaussians = enc_out.gaussians
+        poses = encoder_output.pred_context_pose
+        gaussians = Gaussians.from_anysplat(encoder_output.gaussians)
         return poses, gaussians

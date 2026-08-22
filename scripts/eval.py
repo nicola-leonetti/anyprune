@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 from pathlib import Path
 from torch.utils.data import random_split, DataLoader
 
+from anyprune import Gaussians
 from anyprune.datasets import DL3DVDataset
 from anyprune.wrappers import FrozenAnySplat
 
