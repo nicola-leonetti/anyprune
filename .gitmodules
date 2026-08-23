@@ -7,3 +7,6 @@
 [submodule "anyprune/models/external/YoNoSplat"]
 	path = anyprune/models/external/YoNoSplat
 	url = https://github.com/cvg/YoNoSplat.git
+[submodule "anyprune/datasets/external/splatformer_data_generator"]
+	path = anyprune/datasets/external/splatformer_data_generator
+	url = https://github.com/ChenYutongTHU/SplatFormer_DataGenerator.git
