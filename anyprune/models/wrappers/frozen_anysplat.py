@@ -2,13 +2,15 @@
 A PyTorch module to run AnySplat to produce Gaussians from a set of 
 views, all with a simplified interface.
 """
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from anyprune.utils import _muted
-with _muted(True): from ..models import AnySplat
-from ..gaussians import Gaussians
+with _muted(True): from ..utils import build_anysplat
+from ...gaussians import Gaussians
 
 
 class FrozenAnySplat(nn.Module):
@@ -16,9 +18,31 @@ class FrozenAnySplat(nn.Module):
         super().__init__()
         self.quiet = quiet
         with _muted(quiet):
-            self.model = AnySplat.from_pretrained(pretrained_ckpt)
+            self.model = build_anysplat(pretrained_ckpt)
         self.model.eval()
         self.model.requires_grad_(False)
+
+    @contextmanager
+    def _voxelization(self, enabled: bool | None):
+        """
+        Temporarily override the encoder's voxelization flag.
+
+        The encoder reads cfg.voxelize afresh on every forward pass, so
+        flipping it around a call is enough to switch between the fused
+        voxel Gaussians and one Gaussian per pixel, without building a
+        second copy of the weights. Passing None leaves the checkpoint's
+        own setting alone.
+        """
+        cfg = self.model.encoder.cfg
+        if enabled is None or enabled == cfg.voxelize:
+            yield
+            return
+        previous = cfg.voxelize
+        cfg.voxelize = enabled
+        try:
+            yield
+        finally:
+            cfg.voxelize = previous
 
     @staticmethod
     def _to_dl3dv_convention(
@@ -48,7 +72,7 @@ class FrozenAnySplat(nn.Module):
 
         return poses, intrinsics
 
-    def forward(self, context_images: Tensor):
+    def forward(self, context_images: Tensor, voxelize: bool | None = None):
         """
         Takes a (V, 3, H, W) tensor of images in [0, 1] and returns a
         tuple (poses, intrinsics, gaussians).
@@ -56,10 +80,15 @@ class FrozenAnySplat(nn.Module):
         Poses is a (V, 4, 4) tensor of camera-to-world matrices and
         intrinsics a (V, 3, 3) tensor of pinhole matrices, both already
         in the convention that Gaussians.rasterize() expects.
+
+        Set voxelize to False to get the dense, one-Gaussian-per-pixel
+        prediction instead of the voxel-fused one, or to True to force
+        fusion on. The default of None keeps whatever the checkpoint was
+        configured with (voxelization on, for lhjiang/anysplat).
         """
         assert context_images.shape[1] == 3, f"Expected (V, 3, H, W) shape for context images, got {context_images.shape}"
         assert context_images.dim() == 4, f"context_images should have dim 4, got {context_images.dim()}"
-        with _muted(self.quiet):
+        with _muted(self.quiet), self._voxelization(voxelize):
             # The encoder works on batches of scenes, we do one at a time
             encoder_output = self.model.encoder(
                 context_images.unsqueeze(0), global_step=0, visualization_dump=None

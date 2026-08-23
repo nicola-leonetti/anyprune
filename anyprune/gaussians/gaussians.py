@@ -8,7 +8,9 @@ import gsplat
 import torch
 from torch import Tensor
 
-from ..models.utils import AnySplatGaussians, build_anysplat_covariance
+from ..models.utils import (
+    AnySplatGaussians, YoNoSplatGaussians, build_anysplat_covariance
+)
 
 
 @dataclass
@@ -119,6 +121,21 @@ class Gaussians:
     def from_anysplat(cls, gaussians: AnySplatGaussians) -> "Gaussians":
         assert gaussians.means.shape[0] == 1, (
             f"Expected a single scene from AnySplat, got a batch of {gaussians.means.shape[0]}"
+        )
+        return cls(
+            means=gaussians.means[0],
+            covariances=gaussians.covariances[0],
+            harmonics=gaussians.harmonics[0],
+            opacities=gaussians.opacities[0],
+            scales=gaussians.scales[0],
+            rotations=gaussians.rotations[0],
+            normalized=False,
+        )
+
+    @classmethod
+    def from_yonosplat(cls, gaussians: YoNoSplatGaussians) -> "Gaussians":
+        assert gaussians.means.shape[0] == 1, (
+            f"Expected a single scene from YoNoSplat, got a batch of {gaussians.means.shape[0]}"
         )
         return cls(
             means=gaussians.means[0],

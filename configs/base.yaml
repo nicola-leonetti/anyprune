@@ -2,3 +2,4 @@
 seed: 42
 
 anysplat_checkpoint: lhjiang/anysplat
+yonosplat_checkpoint: botaoye/YoNoSplat/dl3dv_224x224_ctx2to32.ckpt

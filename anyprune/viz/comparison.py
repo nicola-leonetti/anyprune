@@ -2,13 +2,15 @@
 Figures putting side by side the results of different models.
 """
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 import torch
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from torch import Tensor
+
+from ..evaluation import psnr
 
 
 # Assigned to models in this fixed order, never cycled, so that a model
@@ -19,6 +21,10 @@ _MODEL_COLORS = (
 )
 _INK = "#52514e"
 _AXIS_COLOR = "#c9c8c3"
+
+# How much room to leave between the block of context views and the
+# block of held-out ones, as a fraction of the height of a row.
+_BLOCK_GAP = 0.45
 
 
 def _format_count(count: float, _position=None) -> str:
@@ -53,8 +59,11 @@ def _evenly_spaced(num_frames: int, num_shown: int) -> Tensor:
     return torch.linspace(0, num_frames - 1, min(num_shown, num_frames)).round().long()
 
 
-def _plot_frames(axes, frames: Tensor, label: str):
-    """Draw a (V, 3, H, W) tensor along a row of axes."""
+def _plot_frames(axes, frames: Tensor, label: str, scores: Optional[Tensor] = None):
+    """
+    Draw a (V, 3, H, W) tensor along a row of axes, writing each frame's
+    PSNR against the ground truth on it when there is one to write.
+    """
     for axis, frame in zip(axes, frames):
         axis.imshow(frame.permute(1, 2, 0).cpu().numpy())
     for axis in axes:
@@ -63,6 +72,17 @@ def _plot_frames(axes, frames: Tensor, label: str):
     for axis in axes[len(frames):]:
         axis.set_visible(False)
     axes[0].set_ylabel(label, fontsize=9)
+
+    if scores is None:
+        return
+    for axis, score in zip(axes, scores):
+        axis.text(
+            0.035, 0.035, f"{score:.2f} dB",
+            transform=axis.transAxes, ha="left", va="bottom",
+            fontsize=8, color=_INK,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                      edgecolor="none", alpha=0.75),
+        )
 
 
 def _plot_gaussian_counts(axis, reconstructions: Sequence[ModelReconstruction]):
@@ -107,7 +127,8 @@ def plot_reconstructions(
     reconstructed from and the held-out views it did not, each opening
     with the ground truth and followed by one row per model, plus a
     panel counting the Gaussians each model produced. `num_shown` frames
-    are drawn per row, sampled evenly along the trajectory.
+    are drawn per row, sampled evenly along the trajectory, and every
+    rendered frame is labelled with its PSNR, the row with their mean.
 
     `context_images` and `test_images` are (V, 3, H, W) in [0, 1], and
     have to line up with the renders each ModelReconstruction carries.
@@ -117,25 +138,36 @@ def plot_reconstructions(
     context_shown = _evenly_spaced(context_images.shape[0], num_shown)
     test_shown = _evenly_spaced(test_images.shape[0], num_shown)
 
-    rows = [(context_images[context_shown], "context views\nground truth")]
-    rows += [
-        (r.self_recon[context_shown], r.name) for r in reconstructions
+    def model_row(render: Tensor, truth: Tensor, shown: Tensor, name: str):
+        """One model's row, scored against the views it is drawn over."""
+        scores = psnr(render, truth)
+        return render[shown], f"{name}\n{scores.mean():.2f} dB", scores[shown]
+
+    context_rows = [(context_images[context_shown], "context views\nground truth", None)]
+    context_rows += [
+        model_row(r.self_recon, context_images, context_shown, r.name)
+        for r in reconstructions
     ]
-    rows += [(test_images[test_shown], "held-out views\nground truth")]
-    rows += [
-        (r.test_render[test_shown], r.name) for r in reconstructions
+    test_rows = [(test_images[test_shown], "held-out views\nground truth", None)]
+    test_rows += [
+        model_row(r.test_render, test_images, test_shown, r.name)
+        for r in reconstructions
     ]
+    # An empty row of its own tells the two blocks apart
+    rows = context_rows + [None] + test_rows
 
     num_columns = max(len(context_shown), len(test_shown))
     counts_height = 0.22 + 0.16 * len(reconstructions)
-    figure = plt.figure(figsize=(1.8 * num_columns, 1.85 * (len(rows) + counts_height) + 0.6))
-    grid = figure.add_gridspec(
-        len(rows) + 1, num_columns, height_ratios=[1] * len(rows) + [counts_height]
-    )
+    heights = [_BLOCK_GAP if row is None else 1 for row in rows] + [counts_height]
+    figure = plt.figure(figsize=(1.8 * num_columns, 1.85 * sum(heights) + 0.6))
+    grid = figure.add_gridspec(len(heights), num_columns, height_ratios=heights)
 
-    for row, (frames, label) in enumerate(rows):
+    for row, entry in enumerate(rows):
+        if entry is None:
+            continue
+        frames, label, scores = entry
         axes = [figure.add_subplot(grid[row, column]) for column in range(num_columns)]
-        _plot_frames(axes, frames, label)
+        _plot_frames(axes, frames, label, scores)
     _plot_gaussian_counts(figure.add_subplot(grid[len(rows), :]), reconstructions)
 
     figure.suptitle(title)
