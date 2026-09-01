@@ -3,6 +3,7 @@
 .env
 .vscode/
 NOTES.md
+configs/sweeps/
 
 # Python-related
 __pycache__/
