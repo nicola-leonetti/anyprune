@@ -1,0 +1,66 @@
+{
+  "shared": {
+    "optim.total_steps": 2000,
+    "validation.interval": 500,
+    "validation.num_image_scenes": 2,
+    "reconstructor.training": "YoNoSplat",
+    "reconstructor.validation": [
+      "YoNoSplat",
+      "AnySplat"
+    ],
+    "MIN_GAUSSIANS": 50000,
+    "MAX_GAUSSIANS": 500000,
+    "device_max_gaussians": 120000,
+    "optim.oom_max_retries": 3,
+    "log.save_interval": 2000
+  },
+  "runs": [
+    {
+      "name": "cosine-lr-decay",
+      "notes": "Control settings with the learning rate annealed to zero rather than held. Tests whether the late-run damage to the dense budgets is the constant rate still moving the weights once the sparse budgets have converged.",
+      "overrides": {
+        "optim.lr_schedule": "cosine"
+      }
+    },
+    {
+      "name": "nvs-only-supervision",
+      "notes": "Photometric loss on the held-out views alone rather than on those plus the context views. Tests whether supervising only novel views buys generalization, both to the held-out reconstructor and to the views validation actually scores.",
+      "overrides": {
+        "supervision.views": "test"
+      }
+    },
+    {
+      "name": "lr-3x-cosine",
+      "notes": "Three times SplatFormer's second-stage rates, annealed. Tests whether 2000 steps at 3e-5 is simply too little movement, with the anneal there to keep the end of the run from paying for the larger steps.",
+      "overrides": {
+        "optim.lr_schedule": "cosine",
+        "optim.learning_rates": {
+          "base": 9e-05,
+          "embedding": 9e-05,
+          "backbone": 9e-05,
+          "features_dc": 9e-05,
+          "features_rest": 4.5e-06,
+          "scales": 9e-05,
+          "opacities": 9e-05,
+          "quats": 9e-05,
+          "means": 9e-05
+        }
+      }
+    },
+    {
+      "name": "dense-fields-180k",
+      "notes": "As dense a training field as this card holds, 180k Gaussians over at most six context views. Tests the standing failure directly: the two dense validation budgets are far past anything a step has ever refined, and they are where refinement loses PSNR rather than winning it.",
+      "overrides": {
+        "device_max_gaussians": 180000,
+        "DEVICE_MAX_CONTEXT_VIEWS": 6
+      }
+    },
+    {
+      "name": "sparse-budgets-from-20k",
+      "notes": "Budgets drawn from 20k rather than 50k, widening the thinning the run is trained across at the sparse end. Tests whether the sparse budgets, where refinement already wins the most, have more to give.",
+      "overrides": {
+        "MIN_GAUSSIANS": 20000
+      }
+    }
+  ]
+}

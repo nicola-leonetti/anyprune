@@ -2,4 +2,3 @@ defaults:
   - base
   - machine: ???
   - _self_
-

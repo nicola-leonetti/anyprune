@@ -1,0 +1,42 @@
+{
+  "shared": {
+    "optim.total_steps": 2000,
+    "validation.interval": 500,
+    "validation.num_scenes": 16,
+    "validation.num_image_scenes": 1,
+    "reconstructor.training": "YoNoSplat",
+    "reconstructor.validation": [
+      "YoNoSplat",
+      "AnySplat"
+    ],
+    "validation.context_views": [
+      6,
+      16
+    ],
+    "context_views.min": 2,
+    "budget.min_fraction": 0.1,
+    "supervision.max_views": 8,
+    "device_max_gaussians": 500000,
+    "splatformer.zero_output_heads": false,
+    "optim.oom_max_retries": 3,
+    "log.save_interval": 2000
+  },
+  "runs": [
+    {
+      "name": "mid-16-full-fraction",
+      "notes": "The best run on record with the thinning drawn up to the whole prediction rather than up to nine tenths of it. mid-16-views-500k took the dense end without paying for it in the mean, and the one share it still never trains on is the one validation's widest budget hands over: at six context views the field is 301,056 Gaussians and the 500k budget thins nothing at all. This is the last out-of-distribution gap at that budget.",
+      "overrides": {
+        "context_views.max": 16,
+        "budget.max_fraction": 1.0
+      }
+    },
+    {
+      "name": "mid-24-views-500k",
+      "notes": "Is sixteen the right cap, or only better than sixty-four? Two to twenty-four views on the same ceiling, predicting up to 1,204,224 Gaussians so the thinning runs to 42%. Queued but not launched unattended.",
+      "overrides": {
+        "context_views.max": 24,
+        "budget.max_fraction": 0.9
+      }
+    }
+  ]
+}

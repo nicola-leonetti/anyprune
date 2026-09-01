@@ -1,27 +1,24 @@
 """
 A model-agnostic container for the Gaussians from 3DGS.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import gsplat
 import torch
-from torch import Tensor
+from torch import Generator, Tensor
 
-from ..models.utils import (
-    AnySplatGaussians, YoNoSplatGaussians, build_anysplat_covariance
-)
+from ..models.utils import AnySplatGaussians, YoNoSplatGaussians
 
 
 @dataclass
 class Gaussians:
     """
     A model-agnostic representation of a 3DGS set of Gaussians.
-    
-    'normalized' tracks wether means and scales are normalized or not.
-    By 'normalized', we mean:
-    - per-scene min-max normalization of gaussians.means into [0, 1]
-    - gaussians.scales shifted by the corresponding log-scale factor.
+
+
+    Parameters are not normalized and are expressed in the same world
+    frame as the cameras.
     """
     means: Tensor # (N, 3)
     covariances: Tensor # (N, 3, 3)
@@ -29,8 +26,6 @@ class Gaussians:
     opacities: Tensor # (N,)
     scales: Tensor # (N, 3)
     rotations: Tensor # (N, 4)
-
-    normalized: bool
 
     @property
     def num_gaussians(self) -> int:
@@ -52,9 +47,10 @@ class Gaussians:
         near_plane: float = 0.01,
         far_plane: float = 1e10,
         background: Optional[Tensor] = None,
+        views_per_pass: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        Renders the Gaussians from V viewpoints and returns a tuple
+        Renders the Gaussians from V poses and returns a tuple
         (colors, alphas) of shapes (V, 3, H, W) and (V, 1, H, W), with
         colors in [0, 1].
 
@@ -68,14 +64,16 @@ class Gaussians:
             [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] of shape (V, 3, 3), 
             in *pixels* of the rendered image.
 
-        Beware that AnySplat does not use this convention: its predicted
+        (note that AnySplat does not use this convention: its predicted
         extrinsics are camera-to-world in the OpenCV convention, and its
         intrinsics are normalized by the image size, so both have to be
-        converted before they reach this method.
+        converted before they reach this method).
 
-        The poses also have to live in the same frame as 'means': when
-        `normalized` is set that is the per-scene normalized frame, not
-        the world frame the original dataset's poses are given in.
+        The poses also have to live in the same frame as 'means'.
+
+        'views_per_pass' renders the views in groups of that size rather
+        than all at once to avoid allocating too much memory at once and
+        does not influence the final rendered result.
         """
         assert self.means.is_cuda, \
             "gsplat's rasterizer is CUDA only, move the Gaussians to a GPU first"
@@ -92,27 +90,43 @@ class Gaussians:
         )
         viewmats = torch.linalg.inv(poses @ opengl_to_opencv)
 
-        colors, alphas, _ = gsplat.rasterization(
-            means=self.means,
-            # We hand gsplat the covariances rather than the scales and
-            # rotations: the quaternion layout of `rotations` is
-            # whichever one the source model used (AnySplat's is xyzw,
-            # gsplat expects wxyz), while the covariances mean the same
-            # thing whoever built them.
-            quats=None,
-            scales=None,
-            opacities=self.opacities,
-            colors=self.harmonics.transpose(-2, -1).contiguous(), # (N, d_sh, 3)
-            viewmats=viewmats,
-            Ks=intrinsics,
-            width=width,
-            height=height,
-            near_plane=near_plane,
-            far_plane=far_plane,
-            sh_degree=self.sh_degree,
-            backgrounds=background,
-            covars=self.covariances,
+        num_views = viewmats.shape[0]
+        assert num_views > 0, "There are no views to render from"
+        assert background is None or background.shape[0] == num_views, (
+            "gsplat wants one background per view, got "
+            f"{background.shape[0]} for {num_views} views"
         )
+        assert views_per_pass is None or views_per_pass > 0, (
+            f"Cannot render {views_per_pass} views at a time"
+        )
+        # A camera is rasterized independently of every other one, so
+        # the groups only decide what is in flight at once
+        harmonics = self.harmonics.transpose(-2, -1).contiguous() # (N, d_sh, 3)
+        rendered = []
+        for first in range(0, num_views, views_per_pass or num_views):
+            group = slice(first, first + (views_per_pass or num_views))
+            colors, alphas, _ = gsplat.rasterization(
+                means=self.means,
+                # We hand gsplat the covariances rather than the scales
+                # and rotations because covariances are 
+                # model-independent
+                quats=None,
+                scales=None,
+                opacities=self.opacities,
+                colors=harmonics,
+                viewmats=viewmats[group],
+                Ks=intrinsics[group],
+                width=width,
+                height=height,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                sh_degree=self.sh_degree,
+                backgrounds=None if background is None else background[group],
+                covars=self.covariances,
+            )
+            rendered.append((colors, alphas))
+        colors = torch.cat([colors for colors, _ in rendered], dim=0)
+        alphas = torch.cat([alphas for _, alphas in rendered], dim=0)
         colors = colors.clamp(0.0, 1.0).permute(0, 3, 1, 2) # (V, 3, H, W)
         alphas = alphas.permute(0, 3, 1, 2)                 # (V, 1, H, W)
         return colors, alphas
@@ -129,7 +143,6 @@ class Gaussians:
             opacities=gaussians.opacities[0],
             scales=gaussians.scales[0],
             rotations=gaussians.rotations[0],
-            normalized=False,
         )
 
     @classmethod
@@ -144,28 +157,29 @@ class Gaussians:
             opacities=gaussians.opacities[0],
             scales=gaussians.scales[0],
             rotations=gaussians.rotations[0],
-            normalized=False,
         )
 
-    @classmethod
-    def from_splatformer(cls, gs: dict) -> "Gaussians":
-        scales = torch.exp(gs["scales"])
-        rotations = gs["quats"] / gs["quats"].norm(dim=-1, keepdim=True)
-        opacities = torch.sigmoid(gs["opacities"]).squeeze(-1)
+    def subsample(
+        self, num_gaussians: int, generator: Optional[Generator] = None
+    ) -> "Gaussians":
+        """
+        Draw `num_gaussians` of the Gaussians uniformly at random,
+        returning the set unchanged if it is already that small.
 
-        features_dc = gs["features_dc"].unsqueeze(-1)  # (N, 3, 1)
-        if "features_rest" in gs:
-            features_rest = gs["features_rest"].transpose(-2, -1)  # (N, 3, d_sh - 1)
-            harmonics = torch.cat([features_dc, features_rest], dim=-1)  # (N, 3, d_sh)
-        else:
-            harmonics = features_dc  # (N, 3, 1), sh_degree == 0
-
-        return cls(
-            means=gs["means"],
-            covariances=build_anysplat_covariance(scales, rotations),
-            harmonics=harmonics,
-            opacities=opacities,
-            scales=scales,
-            rotations=rotations,
-            normalized=True,
+        Optionally accepts a PyTorch Generator to leave the GPU RNG
+        untouched.
+        """
+        if self.num_gaussians <= num_gaussians: return self
+        # Drawn on the CPU so that the caller's generator, which seeds
+        # the view sampling too, does not have to live on the GPU
+        kept = torch.randperm(self.num_gaussians, generator=generator)[:num_gaussians]
+        kept = kept.to(self.device)
+        return replace(
+            self,
+            means=self.means[kept],
+            covariances=self.covariances[kept],
+            harmonics=self.harmonics[kept],
+            opacities=self.opacities[kept],
+            scales=self.scales[kept],
+            rotations=self.rotations[kept],
         )

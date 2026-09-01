@@ -1,5 +1,5 @@
 """
-Metrics used to score the models against one another.
+Metrics used to score the models.
 """
 from .metrics import psnr
 

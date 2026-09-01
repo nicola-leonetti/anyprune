@@ -1,0 +1,62 @@
+{
+  "shared": {
+    "optim.total_steps": 2000,
+    "validation.interval": 500,
+    "validation.num_scenes": 16,
+    "validation.num_image_scenes": 1,
+    "reconstructor.training": "YoNoSplat",
+    "reconstructor.validation": [
+      "YoNoSplat",
+      "AnySplat"
+    ],
+    "validation.context_views": [
+      6,
+      16
+    ],
+    "budget.min_fraction": 0.1,
+    "budget.max_fraction": 0.9,
+    "supervision.max_views": 8,
+    "splatformer.zero_output_heads": false,
+    "optim.oom_max_retries": 3,
+    "log.save_interval": 2000
+  },
+  "runs": [
+    {
+      "name": "wide-64-views-500k",
+      "notes": "The whole range YoNoSplat is deployed over, on both axes at once: two to sixty-four context views, and up to 500,000 Gaussians refined per step. Measured, a context view is 50,176 Gaussians, so this spans predictions of 100,352 to 3,211,264 and thinnings of 10% to 90% of whichever of them a step drew. 500,000 is what the card holds once the loss is taken on eight views rather than on all of them, and it is also the widest budget validation scores at: every run before this refined a thinner field than the one it was asked about at 500k, which is the budget none of them came out positive on.",
+      "overrides": {
+        "context_views.min": 2,
+        "context_views.max": 64,
+        "device_max_gaussians": 500000
+      }
+    },
+    {
+      "name": "mid-16-views-500k",
+      "notes": "The same 500,000 ceiling over two to sixteen context views. Against the run above this separates the two things that changed at once: whether refining denser fields is what pays, or whether reconstructing from far more views is. Sixteen views predicts 802,816 Gaussians, so the ceiling still binds and the thinning still runs to 62%, while every step stays inside the checkpoint's own ctx2to32 range.",
+      "overrides": {
+        "context_views.min": 2,
+        "context_views.max": 16,
+        "device_max_gaussians": 500000
+      }
+    },
+    {
+      "name": "wide-64-full-fraction",
+      "notes": "The wide run with the thinning drawn up to the whole prediction rather than up to nine tenths of it. Validation's widest budget hands over every Gaussian the reconstructor made - at six views the field is 301,056 and the 500k budget thins nothing - so a run capped at 0.9 is asked about a share it never trained on, and that budget is the one no run has come out positive on. This is the cheapest thing that closes the gap.",
+      "overrides": {
+        "context_views.min": 2,
+        "context_views.max": 64,
+        "device_max_gaussians": 500000,
+        "budget.max_fraction": 1.0
+      }
+    },
+    {
+      "name": "wide-64-views-300k",
+      "notes": "Two to sixty-four context views under the old 300,000 ceiling, which is the other half of the same separation: the view range of the run above with the density of the runs before it. If the wide run wins and this one does not, the ceiling is what mattered.",
+      "overrides": {
+        "context_views.min": 2,
+        "context_views.max": 64,
+        "device_max_gaussians": 300000
+      }
+    }
+  ]
+}

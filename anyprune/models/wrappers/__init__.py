@@ -4,8 +4,10 @@ provide a simplified interface for use in the rest of the project.
 """
 from .frozen_anysplat import FrozenAnySplat
 from .frozen_yonosplat import FrozenYoNoSplat
+from .splatformer import SplatFormer
 
 __all__ = [
     "FrozenAnySplat",
     "FrozenYoNoSplat",
+    "SplatFormer",
 ]

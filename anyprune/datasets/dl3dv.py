@@ -15,7 +15,7 @@ This dataset's directory structure is
 import json
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from pathlib import Path
@@ -124,13 +124,20 @@ def _read_intrinsics(scene_dir: str, img_subdir: str) -> Tensor:
     return intrinsics.expand(len(img_paths), 1, 3, 3).contiguous() # (V, 1, 3, 3)
 
 
-def _read_image_info(scene_dir: str, img_subdir: str) -> Tensor:
+def _read_image_info(
+    scene_dir: str, img_subdir: str, frames: Optional[Sequence[int]] = None
+) -> Tensor:
     """
     Given the directory of a scene and the img_subdir subfolder
     containing the frames, reads the images in the directory to get a
-    (V, 3, H, W) tensor with all the frames.
+    (V, 3, H, W) tensor with the frames.
+
+    Optionally, 'frames' can be provided to read only a subset of the
+    images on disk.
     """
     img_paths = _read_img_paths(scene_dir, img_subdir)
+    if frames is not None:
+        img_paths = [img_paths[frame] for frame in frames]
     images = [process_image(path) for path in img_paths]
     # normalize from [-1, 1] to [0, 1]
     images = torch.stack(images, dim=0).mul_(0.5).add_(0.5)
@@ -152,25 +159,41 @@ class DL3DVDataset(Dataset):
     def __len__(self):
         return len(self.scenes)
 
+    def num_frames(self, idx: int) -> int:
+        """
+        How many frames the scene of index idx has, without reading any
+        of them.
+        """
+        return len(_read_img_paths(self.scenes[idx], self.img_subdir))
+
     def __getitem__(self, idx):
+        return self.get_frames(idx)
+
+    def get_frames(self, idx: int, frames: Optional[Sequence[int]] = None):
         """
         Returns {images: images, poses: poses, intrinsics: intrinsics}
 
-        Images is a (V, 3, H, W) tensor with all images in the scene of
-        index idx, normalized to be in [0, 1].
+        Images is a (V, 3, H, W) tensor with the V images with indices
+        specified in 'frames', or all of the available images if 
+        'frames' is left unspecified.
 
-        Poses is a (V, 1, 4, 4) tensor containing the poses of each
+        Images are normalized to be in [0, 1].
+
+        'poses' is a (V, 1, 4, 4) tensor containing the poses of each
         image, as camera-to-world matrices with OpenGL camera axes. See
         Gaussians.rasterize() for the full convention.
 
-        Intrinsics is a (V, 1, 3, 3) tensor of pinhole camera matrices, 
-        expressed in terms of pixels of the corresponding image returned
-        by this method.
+        'intrinsics' is a (V, 1, 3, 3) tensor of pinhole camera 
+        matrices, expressed in terms of pixels of the corresponding 
+        image returned by this method.
         """
         scene_path = self.scenes[idx]
-        images = _read_image_info(scene_path, self.img_subdir)
+        images = _read_image_info(scene_path, self.img_subdir, frames)
         poses =  _read_poses(scene_path)
         intrinsics = _read_intrinsics(scene_path, self.img_subdir)
+        if frames is not None:
+            selection = torch.as_tensor(frames, dtype=torch.long)
+            poses, intrinsics = poses[selection], intrinsics[selection]
         assert images.shape[-2:] == (PROCESSED_IMAGE_SIZE, PROCESSED_IMAGE_SIZE), (
             f"Intrinsics are computed for {PROCESSED_IMAGE_SIZE}x{PROCESSED_IMAGE_SIZE} "
             f"images, but the frames are {tuple(images.shape[-2:])}"

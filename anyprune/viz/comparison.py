@@ -2,15 +2,15 @@
 Figures putting side by side the results of different models.
 """
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Sequence
 
 import matplotlib.pyplot as plt
-import torch
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from torch import Tensor
 
 from ..evaluation import psnr
+from ._common import BLOCK_GAP, INK, evenly_spaced, plot_frames
 
 
 # Assigned to models in this fixed order, never cycled, so that a model
@@ -19,12 +19,7 @@ _MODEL_COLORS = (
     "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
     "#e87ba4", "#008300", "#4a3aa7", "#e34948",
 )
-_INK = "#52514e"
 _AXIS_COLOR = "#c9c8c3"
-
-# How much room to leave between the block of context views and the
-# block of held-out ones, as a fraction of the height of a row.
-_BLOCK_GAP = 0.45
 
 
 def _format_count(count: float, _position=None) -> str:
@@ -51,40 +46,6 @@ class ModelReconstruction:
     test_render: Tensor
 
 
-def _evenly_spaced(num_frames: int, num_shown: int) -> Tensor:
-    """
-    Indices of `num_shown` frames spread evenly over a trajectory of
-    `num_frames`, endpoints included.
-    """
-    return torch.linspace(0, num_frames - 1, min(num_shown, num_frames)).round().long()
-
-
-def _plot_frames(axes, frames: Tensor, label: str, scores: Optional[Tensor] = None):
-    """
-    Draw a (V, 3, H, W) tensor along a row of axes, writing each frame's
-    PSNR against the ground truth on it when there is one to write.
-    """
-    for axis, frame in zip(axes, frames):
-        axis.imshow(frame.permute(1, 2, 0).cpu().numpy())
-    for axis in axes:
-        axis.set_xticks([])
-        axis.set_yticks([])
-    for axis in axes[len(frames):]:
-        axis.set_visible(False)
-    axes[0].set_ylabel(label, fontsize=9)
-
-    if scores is None:
-        return
-    for axis, score in zip(axes, scores):
-        axis.text(
-            0.035, 0.035, f"{score:.2f} dB",
-            transform=axis.transAxes, ha="left", va="bottom",
-            fontsize=8, color=_INK,
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
-                      edgecolor="none", alpha=0.75),
-        )
-
-
 def _plot_gaussian_counts(axis, reconstructions: Sequence[ModelReconstruction]):
     """
     How many Gaussians each model spent on the scene, written out on the
@@ -98,16 +59,16 @@ def _plot_gaussian_counts(axis, reconstructions: Sequence[ModelReconstruction]):
         color=[_MODEL_COLORS[position % len(_MODEL_COLORS)] for position in positions],
     )
     for position, count in zip(positions, counts):
-        axis.text(count, position, f"  {count:,}", va="center", fontsize=9, color=_INK)
+        axis.text(count, position, f"  {count:,}", va="center", fontsize=9, color=INK)
 
     axis.set_yticks(positions)
     axis.set_yticklabels([r.name for r in reconstructions], fontsize=9)
     axis.invert_yaxis()
-    axis.set_xlabel("Gaussians reconstructed", fontsize=9, color=_INK)
+    axis.set_xlabel("Gaussians reconstructed", fontsize=9, color=INK)
     # Leave the bars room to be labelled without running off the axis
     axis.set_xlim(0, max(counts) * 1.2)
     axis.xaxis.set_major_formatter(FuncFormatter(_format_count))
-    axis.tick_params(labelsize=8, colors=_INK, length=0)
+    axis.tick_params(labelsize=8, colors=INK, length=0)
     for side in ("top", "right", "left"):
         axis.spines[side].set_visible(False)
     axis.spines["bottom"].set_color(_AXIS_COLOR)
@@ -135,8 +96,8 @@ def plot_reconstructions(
     """
     assert reconstructions, "Nothing to compare"
 
-    context_shown = _evenly_spaced(context_images.shape[0], num_shown)
-    test_shown = _evenly_spaced(test_images.shape[0], num_shown)
+    context_shown = evenly_spaced(context_images.shape[0], num_shown)
+    test_shown = evenly_spaced(test_images.shape[0], num_shown)
 
     def model_row(render: Tensor, truth: Tensor, shown: Tensor, name: str):
         """One model's row, scored against the views it is drawn over."""
@@ -158,7 +119,7 @@ def plot_reconstructions(
 
     num_columns = max(len(context_shown), len(test_shown))
     counts_height = 0.22 + 0.16 * len(reconstructions)
-    heights = [_BLOCK_GAP if row is None else 1 for row in rows] + [counts_height]
+    heights = [BLOCK_GAP if row is None else 1 for row in rows] + [counts_height]
     figure = plt.figure(figsize=(1.8 * num_columns, 1.85 * sum(heights) + 0.6))
     grid = figure.add_gridspec(len(heights), num_columns, height_ratios=heights)
 
@@ -167,7 +128,7 @@ def plot_reconstructions(
             continue
         frames, label, scores = entry
         axes = [figure.add_subplot(grid[row, column]) for column in range(num_columns)]
-        _plot_frames(axes, frames, label, scores)
+        plot_frames(axes, frames, label, scores)
     _plot_gaussian_counts(figure.add_subplot(grid[len(rows), :]), reconstructions)
 
     figure.suptitle(title)

@@ -1,6 +1,7 @@
 # Miscellaneous
-.vscode
+.claude/
 .env
+.vscode/
 NOTES.md
 
 # Python-related

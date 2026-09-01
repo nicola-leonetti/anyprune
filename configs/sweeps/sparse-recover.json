@@ -1,0 +1,36 @@
+{
+  "shared": {
+    "optim.total_steps": 3000,
+    "validation.interval": 1000,
+    "validation.skip_initial": true,
+    "validation.num_scenes": 16,
+    "validation.num_image_scenes": 1,
+    "reconstructor.training": "YoNoSplat",
+    "reconstructor.validation": [
+      "YoNoSplat",
+      "AnySplat"
+    ],
+    "validation.context_views": [
+      6,
+      16
+    ],
+    "context_views.min": 2,
+    "context_views.max": 16,
+    "budget.min_fraction": 0.1,
+    "budget.max_fraction": 0.9,
+    "supervision.max_views": 8,
+    "optim.ema_decay": 0.999,
+    "splatformer.zero_output_heads": false,
+    "optim.oom_max_retries": 3,
+    "log.save_interval": 3000
+  },
+  "runs": [
+    {
+      "name": "mid-cap-250k-3000-ema",
+      "notes": "The one budget the push missed. 100k is held by a run with a 120k ceiling and 250k is now held by one with a 500k ceiling, and a model specializes to the density it is trained at, so the ceiling is the knob that places it between them. 250,000 is the midpoint of the two regimes, run at the same three thousand steps with the same averaging as final-3000-ema so the ceiling is the only thing that differs.",
+      "overrides": {
+        "device_max_gaussians": 250000
+      }
+    }
+  ]
+}

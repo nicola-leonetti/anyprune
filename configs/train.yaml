@@ -9,3 +9,241 @@ splits:
   train: 0.8
   val: 0.1
   test: 0.1
+split_seed: 0
+
+# The number of context views a step reconstructs from
+context_views:
+  min: 2
+  max: 64
+
+# How far apart along the capture the sampled frames are taken
+view_stride: 1
+
+# How much smaller than the frames the loss is taken on the context
+# views handed to the reconstructor are. Raising this lowers the number
+# of Gaussians by reconstructing a coarser scene rather than by
+# discarding part of a fine one, which is the better trade whenever
+# device_max_gaussians is not the binding constraint.
+context_downscale: 1
+
+supervision:
+  # The views the photometric loss is taken on: 'context' for the ones
+  # the reconstructor saw, 'test' for the held-out ones, 'all' for both.
+  # SplatFormer trains on a mixture of the two, mostly held-out ones.
+  views: all
+  # At most how many of those views the loss is actually taken on, drawn
+  # one per equal stretch of the set so that both halves of it, and the
+  # whole trajectory, are covered by every step.
+  #
+  # This is what lets a run reconstruct from many views at all. A step
+  # renders every view it supervises on with gradients, and gsplat's
+  # intersection buffer grows with the views times the Gaussians, so
+  # supervising all of them ties the width of the render to the number
+  # of context views and makes the two things a run wants to push
+  # compete for the same memory. Measured at 400,000 Gaussians, a
+  # supervision view costs 0.13 GiB: all of them at sixty-four context
+  # views is 128 views and leaves room for about 190,000 Gaussians,
+  # while eight of them leaves room for 600,000.
+  max_views: 8
+
+# What share of the Gaussians the reconstructor predicted a step keeps,
+# drawn afresh every step between these two. The count that follows from
+# a share is what the step is actually handed: predict 100,000
+# Gaussians, draw 0.56, and 56,000 of them are kept, chosen uniformly at
+# random.
+#
+# Drawn from a tenth rather than from a hundredth: a step that keeps 1%
+# of a sixty-four-view prediction is refining 32,000 Gaussians of a
+# scene that was reconstructed from 3.2 million, which is a thinning no
+# deployment would ask for and a signal the loss can say little about.
+budget:
+  min_fraction: 0.1
+  max_fraction: 0.9
+  # Deciding the thinning from what the run has already trained on
+  # instead, so that the field sizes it sees come out level across the
+  # range rather than piled where a uniform share crossed with a uniform
+  # view count happens to put them. On by default; with it on,
+  # min_fraction and max_fraction decide nothing.
+  #
+  # A step's size is bucketed, and the step is sent to the emptiest
+  # bucket it can still reach by thinning, which is any bucket at or
+  # below the one its untouched prediction lands in. See
+  # anyprune/training/balancing.py.
+  balance:
+    enabled: true
+    bucket_size: 10_000
+    # The top of the range that is levelled, which is also a ceiling on
+    # what any step trains on: nothing is ever sent above the top
+    # bucket, so a run never sees a field larger than this however much
+    # the card would hold. Set to the machine's device_max_gaussians, so
+    # that the range a run trains over is the whole range it can hold
+    # and reaches the widest budget validation scores at - below that,
+    # the densest field a step ever refines is thinner than the field it
+    # is asked about and that budget is answered out of distribution.
+    #
+    # It is not read off device_max_gaussians, since the two say
+    # different things: that one is what the card can hold and this is
+    # what the experiment trains over. Lowering the card's ceiling below
+    # this leaves the top buckets unreachable rather than misconfigured
+    # - they simply stay empty, which the spread metric shows.
+    max_gaussians: 500_000
+
+# Which feed-forward method to use for a training step and which ones to
+# use for evaluation, named among 'AnySplat', 'AnySplat-voxelized' and
+# 'YoNoSplat'.
+#
+# The two AnySplats are the same weights read two ways. Plain AnySplat
+# keeps one Gaussian per context pixel, so what it predicts grows with
+# the views it is handed and most of a budget's work is thinning it back
+# down. The voxelized one fuses those Gaussians onto a grid inside the
+# encoder, weighted by the confidence predicted alongside them, and
+# hands back however many voxels the scene occupied: a field that is
+# already sparse, and sparse by geometry rather than by the uniform draw
+# subsample() takes. It is also what the released checkpoint configures
+# itself for, at a voxel size of 0.002.
+reconstructor:
+  training: YoNoSplat
+  validation: [YoNoSplat, AnySplat]
+
+splatformer:
+  checkpoint: ${checkpoints_dir}/splatformer/train-on-objaverse.pth
+  # Whether to zero SplatFormer's output heads once the checkpoint is
+  # loaded, which starts a run from a no-op: the heads predict a
+  # residual per primitive, and a zeroed head predicts a residual of
+  # zero, so the refined Gaussians are the ones handed in. Refinement
+  # then begins at the thinned Gaussians themselves rather than wherever
+  # heads fitted to Objaverse objects put a scene, and psnr_gain starts
+  # a run at zero instead of well below it. The backbone is left as the
+  # checkpoint has it, so what is dropped is the map onto a residual and
+  # not the features it is read off.
+  zero_output_heads: false
+  # Whether to recompute the backbone's transformer blocks in the
+  # backward pass rather than keeping their activations from the forward
+  # one. The backbone is where nearly all of a step's memory goes, and
+  # recomputing it costs about a quarter more time per step and gives
+  # back most of that memory, which is what device_max_gaussians is set
+  # against.
+  gradient_checkpointing: true
+
+optim:
+  total_steps: 2_000
+  # SplatFormer's own second-stage learning rates, from its
+  # configs/train/default.gin under the 'train2D' scope
+  learning_rates:
+    base: 3e-5
+    embedding: 3e-5
+    backbone: 3e-5
+    features_dc: 3e-5
+    features_rest: 1.5e-6
+    scales: 3e-5
+    opacities: 3e-5
+    quats: 3e-5
+    means: 3e-5
+  lr_schedule: constant
+  grad_clip_norm: 2.0
+  l1_loss_weight: 1.0
+  # Weight on the squared error, next to the absolute one. PSNR is a
+  # monotone function of the mean squared error alone, so a run trained
+  # on absolute error is optimizing a different statistic of the
+  # residual than the one it is scored on. See PhotometricLoss for why a
+  # weight of about ten is what puts the two terms' gradients on the
+  # same scale.
+  l2_loss_weight: 0.0
+  # Warning: setting this above 0 raises memory usage
+  lpips_loss_weight: 0
+  # How heavily to average the weights over the run, as the decay of an
+  # exponential moving average, or 0 to keep none. 0.999 averages over
+  # roughly the last thousand steps.
+  #
+  # The average is never trained against: it is kept alongside the live
+  # weights and scored once, in the final validation, under metric names
+  # of its own. A run therefore reports both what it converged to and
+  # what the average of its last thousand steps is worth, and costs one
+  # extra validation pass for the second rather than one per pass.
+  ema_decay: 0.0
+  enable_amp: true
+  # When a step does not fit anyway, how much of the budget to keep on
+  # the next attempt and how many attempts to make before giving up on
+  # the step. Retrying costs the work already done, so this is a tail
+  # treatment: if it fires often, lower device_max_gaussians instead.
+  oom_retry_factor: 0.6
+  oom_max_retries: 3
+
+validation:
+  # Every how many training steps to run validation
+  interval: 500
+  # How many scenes to run validation on
+  num_scenes: 16
+  # The context view counts a pass reconstructs from. Validation holds
+  # the count fixed instead of drawing it, so that its curve over a run
+  # measures the network rather than the draw. More than one of them
+  # sweeps the view range as well: a run trained from two to sixty-four
+  # views is scored at one point of that range otherwise, and the view
+  # count is the thing that decides how much of the field a fixed budget
+  # is even asking for. The first is the one whose metrics keep the
+  # plain names every run before this logged, so a sweep stays
+  # comparable to them; the rest are logged under their own view count.
+  context_views: [6]
+  # At most how many views of a scene a pass renders, of each half,
+  # drawn evenly along the capture off a generator seeded by the scene,
+  # so that a scene is always scored on the same views however far into
+  # the run the pass is and whichever reconstructor produced it.
+  #
+  # What is measured is a mean PSNR over the held-out views, and a mean
+  # over an even six of them is the same quantity as a mean over all
+  # thirty-two, measured on a pass that costs a fifth as much. Without
+  # this a pass over the view sweep is dominated by its widest entry:
+  # every budget renders every view twice, so the cost of a scene grows
+  # with the views times the budgets, and validating from thirty-two
+  # views costs five times what validating from six does while answering
+  # the same question about a field five times as large. At or below
+  # this many views nothing is dropped, so the six-view pass is
+  # untouched and stays comparable with every run before this one.
+  scored_views: 6
+  # Gaussian budgets at which to benchmark each model
+  gaussian_budgets: [50_000, 100_000, 250_000, 500_000]
+  # Whether to skip the pass at step 0. It scores the checkpoint as it
+  # was loaded, before any step, so it is the same numbers for every run
+  # that starts from the same checkpoint and is worth its minutes only
+  # once.
+  skip_initial: false
+  # How many validation scenes a pass draws figures of, taken from the
+  # front of the validation scene list, and which budgets each of them
+  # is drawn at.
+  num_image_scenes: 5
+  image_budgets: [100_000, 250_000]
+  # How many views of each block the figure draws, sampled evenly along
+  # the block rather than taken from its start
+  image_views: 4
+  # Which of what a pass measures is charted. The rest is still printed:
+  # psnr_input and psnr_full are the same numbers every pass, since the
+  # scenes, views and budgets validation uses are all fixed and neither
+  # of them goes through the network, and num_scenes only says how many
+  # of them fit on the card. The two differences are what move:
+  # psnr_gain is what refinement wins back over the thinned Gaussians,
+  # and psnr_vs_full is where that leaves them against the whole
+  # prediction they were thinned out of, negative while the budget still
+  # costs more than refinement recovers.
+  logged_metrics: [psnr_refined, psnr_gain, psnr_vs_full]
+
+wandb:
+  project: anyprune
+  mode: online
+  # The name a run goes under in Weights & Biases, and the name of the
+  # directory its checkpoints are written to. Left unset, wandb makes
+  # one up, which is fine for a run read on its own and useless for a
+  # sweep whose runs are only worth anything next to each other.
+  run_name: null
+  # What the run is for, one line, carried into the run's notes so that
+  # what a configuration was testing survives next to what it scored.
+  notes: null
+  system_metrics: false
+
+log:
+  interval: 10
+  save_interval: 2_000
+  output_dir: ${outputs_dir}/train
+
+# Ask for reproducible cudnn and cublas kernels. A small difference in
+# the numbers and costs time, so disabled by default.
+deterministic: false

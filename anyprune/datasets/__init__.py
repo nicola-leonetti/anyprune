@@ -1,5 +1,5 @@
 """
-Contains the datasets to be used with DL3DV.
+Contains the datasets to be used with SplatFormer.
 """
 from .dl3dv import DL3DVDataset
 

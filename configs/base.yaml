@@ -3,3 +3,10 @@ seed: 42
 
 anysplat_checkpoint: lhjiang/anysplat
 yonosplat_checkpoint: botaoye/YoNoSplat/dl3dv_224x224_ctx2to32.ckpt
+
+# Run where the script was launched from rather than in the run's own
+# output directory, so that the relative paths a sweep is launched with
+# still resolve and outputs land where the config says they do.
+hydra:
+  job:
+    chdir: false
