@@ -8,38 +8,9 @@ outputs_dir: /home/nicola/Desktop/anyprune/outputs
 dl3dv_root_dir: /home/nicola/Desktop/Anysplat-improved/datasets/dl3dv
 dl3dv_images_subdir: images_8
 
-# The ceiling a step's share of the prediction is held under, in
-# Gaussians. Whichever of the two binds is what a step keeps: 0.56 of
-# 100,000 is 56,000, but on a ceiling of 40,000 it is 40,000. This is
-# the one number about the card rather than about the experiment, which
-# is why it lives here.
-#
-# Measured through real steps with the backbone recomputed and the loss
-# taken on eight views, by probe_capacity.py --backward: a step costs
-# 3.8 GiB of weights plus about 1.42 GiB per 100,000 Gaussians and 0.03
-# GiB more per 100,000 per supervision view. 500,000 over sixty-four
-# context views peaks at 12.8 to 13.3 GiB of the 15.6 on this card,
-# 550,000 at 13.6 to 14.1, and 600,000 at 13.9 to 14.9, which is closer
-# to the edge than a run that also has to validate should sit. Without
-# splatformer.gradient_checkpointing nothing above about 150,000 fits
-# at all.
-#
-# 500,000 is also the widest budget validation scores at, which is the
-# one that no run has yet come out positive on: until now the ceiling
-# was below it, so the densest field a step ever refined was thinner
-# than the field it was asked about, and that budget was being answered
-# out of distribution. It no longer is.
+# Loose ceiling on the amount of gaussians the GPU can hold in memory at 
+# training time
 device_max_gaussians: 500_000
 
-# How many views a render is allowed to draw at once, the same split
-# again: what a render is of is the experiment's choice and this is the
-# card's. gsplat sorts the Gaussian-tile intersections of every camera
-# it is handed into one buffer, so a render peaks on the views times the
-# Gaussians rather than on either alone, and the peak is one allocation
-# that has to be found whole. Validation is where that bites, since it
-# renders six views of up to 500k Gaussians, well past anything a
-# training step is allowed to draw: 1.3 GiB of intersection ids at once,
-# on top of two reconstructors and a point transformer. Grouping the
-# views costs nothing but a concatenation and changes no pixel of the
-# result. null renders every view in one pass.
+# How many views to rasterize at once.
 device_max_views_per_render: 2

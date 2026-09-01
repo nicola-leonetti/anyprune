@@ -451,89 +451,6 @@ class ScenePrefetcher:
         self.workers.shutdown()
 
 
-class WeightAverage:
-    """
-    An exponential moving average of a model's floating-point
-    parameters and buffers, kept on the host.
-
-    Held on the CPU because it is read once, at the end of the run, and
-    a second copy of the weights on the card is room the widest step
-    would rather have. The copy back costs a second at the one moment it
-    is needed.
-
-    `apply_to()` swaps the average into the model and hands back what
-    was there, so a caller can score the average and then put the live
-    weights back:
-
-        live = average.apply_to(model)
-        ...
-        average.restore(model, live)
-
-    Integer buffers are left alone: averaging a step counter or a
-    quantization index produces something that is neither of its inputs.
-    """
-
-    def __init__(self, model: nn.Module, decay: float):
-        assert 0 < decay < 1, f"Need a decay in (0, 1), got {decay}"
-        self.decay = decay
-        self.steps = 0
-        self.shadow = {
-            name: tensor.detach().to("cpu", copy=True)
-            for name, tensor in self._averaged(model)
-        }
-
-    def _decay(self) -> float:
-        """
-        The decay to use at this step, warmed up from zero.
-
-        The average starts at the weights the run was initialized from,
-        which are not a point on its trajectory but the place it set out
-        from, and a fixed decay of 0.999 keeps a third of that starting
-        point after a thousand steps. A short run's average would then
-        be mostly its checkpoint, and would score like one. Ramping the
-        decay as t / (1 + t), capped at the asked-for value, leaves the
-        average equal to the running mean of the steps taken so far
-        until that mean is over a window shorter than the decay implies,
-        and equal to the decay from there on. A run of any length then
-        reports an average of its own trajectory.
-        """
-        return min(self.decay, self.steps / (1.0 + self.steps))
-
-    @staticmethod
-    def _averaged(model: nn.Module):
-        """The parameters and buffers an average is taken over."""
-        for name, tensor in list(model.state_dict().items()):
-            if tensor.is_floating_point():
-                yield name, tensor
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        self.steps += 1
-        decay = self._decay()
-        for name, tensor in self._averaged(model):
-            # A blocking copy: the destination is ordinary pageable
-            # host memory, and an asynchronous device-to-host copy into
-            # that is not ordered against the read that follows it, so
-            # the add would fold in whatever the buffer happened to hold.
-            self.shadow[name].mul_(decay).add_(
-                tensor.detach().to("cpu"), alpha=1.0 - decay,
-            )
-
-    @torch.no_grad()
-    def apply_to(self, model: nn.Module) -> Dict[str, Tensor]:
-        """Put the average into the model, returning the live weights."""
-        live = {}
-        for name, tensor in self._averaged(model):
-            live[name] = tensor.detach().clone()
-            tensor.copy_(self.shadow[name].to(tensor.device))
-        return live
-
-    @torch.no_grad()
-    def restore(self, model: nn.Module, live: Dict[str, Tensor]):
-        for name, tensor in self._averaged(model):
-            tensor.copy_(live[name])
-
-
 def refine(
     cfg, splatformer: SplatFormer, gaussians, enable_amp: Optional[bool] = None
 ):
@@ -849,8 +766,8 @@ def run_validation(
     reconstructor.validation and log the result.
 
     `prefix` is what the metrics are logged under, so that a pass taken
-    on something other than the live weights - the run's weight average,
-    at the end - is charted beside them rather than over them.
+    on something other than the live weights is charted beside them
+    rather than over them.
 
     One reconstructor is on the card at a time: a held-out one is built
     for its pass and thrown away again, and the one being trained
@@ -1029,10 +946,6 @@ def main(cfg):
         optimizer, schedule=cfg.optim.lr_schedule, total_step=cfg.optim.total_steps
     )
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.optim.enable_amp)
-    average = (
-        WeightAverage(splatformer.model, cfg.optim.ema_decay)
-        if cfg.optim.ema_decay > 0 else None
-    )
 
     run = wandb.init(
         project=cfg.wandb.project,
@@ -1181,8 +1094,6 @@ def main(cfg):
         if histogram is not None:
             histogram.record(reconstruction.gaussians.num_gaussians)
         scheduler.step()
-        if average is not None:
-            average.update(splatformer.model)
 
         if step % cfg.log.interval == 0:
             with torch.no_grad():
@@ -1259,20 +1170,6 @@ def main(cfg):
         cfg.optim.total_steps,
     )
     torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final.pth")
-
-    if average is not None:
-        # Scored once, here, rather than at every pass: what the average
-        # is worth is a fact about the finished run, and a pass costs
-        # minutes. Its metrics go under names of their own so that the
-        # run reports both and neither is mistaken for the other.
-        print("Validating the weight average...")
-        live = average.apply_to(splatformer.model)
-        torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_ema.pth")
-        run_validation(
-            cfg, splatformer, reconstructor, dataset, validation_scenes,
-            cfg.optim.total_steps, prefix="val_ema",
-        )
-        average.restore(splatformer.model, live)
     wandb.finish()
 
 
