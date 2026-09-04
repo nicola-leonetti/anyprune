@@ -2,3 +2,72 @@ defaults:
   - base
   - machine: ???
   - _self_
+
+# The same division of the scenes a training run makes, so that what is
+# reported here is measured on the scenes no run ever trained or
+# validated on. Both have to match the run being evaluated.
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+split_seed: 0
+
+# Which of those splits to report on, and how many of its scenes, with
+# null meaning every one of them
+split: test
+num_scenes: null
+
+# How far apart along the capture the sampled frames are taken, and how
+# much smaller than the frames the reconstructor is shown them: both
+# also have to match the run being evaluated
+view_stride: 1
+context_downscale: 1
+
+# The feed-forward reconstructor whose predictions are pruned
+reconstructor: YoNoSplat
+
+protocol:
+  # Every scene is fit once per context view count, then thinned down to
+  # each budget in turn and refined
+  context_views: [2, 4, 8, 16, 24, 32, 64]
+  gaussian_budgets: [50_000, 100_000, 250_000, 500_000]
+  # At most how many views of each half of a scene are rendered and
+  # scored, drawn one per equal stretch of the half
+  scored_views: 6
+
+# The single cell the ablation table is read off, which every variant is
+# scored at whether or not it sweeps the whole grid above
+ablation:
+  gaussian_budget: 100_000
+  context_views: 8
+
+# The rows of that table: the run being reported, the runs that dropped
+# one piece of it, and SplatFormer as it was released, which is the
+# zero-shot row. 'sweep' says which of them is also run over the whole
+# protocol grid above, which is what the curves are drawn from.
+variants:
+  - name: AnyPrune (full)
+    checkpoint: ${checkpoints_dir}/anyprune/full.pth
+    sweep: true
+  - name: w/o LPIPS term
+    checkpoint: ${checkpoints_dir}/anyprune/no-lpips.pth
+    sweep: false
+  - name: w/o balanced budget sampling
+    checkpoint: ${checkpoints_dir}/anyprune/no-balancing.pth
+    sweep: false
+  - name: w/o fine-tuning (Objaverse checkpoint, zero-shot)
+    checkpoint: ${checkpoints_dir}/splatformer/train-on-objaverse.pth
+    sweep: false
+
+wandb:
+  project: anyprune
+  mode: online
+  run_name: null
+  notes: null
+  system_metrics: false
+
+log:
+  output_dir: ${outputs_dir}/eval
+
+# Ask for reproducible cudnn and cublas kernels.
+deterministic: false

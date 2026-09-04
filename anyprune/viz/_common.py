@@ -8,6 +8,15 @@ from torch import Tensor
 
 
 INK = "#52514e"
+AXIS_COLOR = "#c9c8c3"
+
+# Handed out to whatever a figure puts side by side, models or budgets,
+# in this fixed order and never cycled, so that a series keeps its color
+# as others join it.
+SERIES_COLORS = (
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+)
 
 # How much room to leave between two blocks of rows, as a fraction of
 # the height of a row.

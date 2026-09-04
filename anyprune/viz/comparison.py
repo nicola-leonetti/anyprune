@@ -10,16 +10,14 @@ from matplotlib.ticker import FuncFormatter
 from torch import Tensor
 
 from ..evaluation import psnr
-from ._common import BLOCK_GAP, INK, evenly_spaced, plot_frames
-
-
-# Assigned to models in this fixed order, never cycled, so that a model
-# keeps its color as others join the comparison.
-_MODEL_COLORS = (
-    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
-    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+from ._common import (
+    AXIS_COLOR, BLOCK_GAP, INK, SERIES_COLORS, evenly_spaced, plot_frames,
 )
-_AXIS_COLOR = "#c9c8c3"
+
+
+# Assigned to models in the order they are compared in
+_MODEL_COLORS = SERIES_COLORS
+_AXIS_COLOR = AXIS_COLOR
 
 
 def _format_count(count: float, _position=None) -> str:

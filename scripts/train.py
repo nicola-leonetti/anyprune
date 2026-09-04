@@ -3,9 +3,10 @@ Fine-tune SplatFormer to adjust the subsampled Gaussians coming from a
 frozen feed-forward reconstructor.
 
 A training step:
-    - samples an even run of frames from one scene
+    - samples an even number of frames from one scene
     - hands half of them to the frozen reconstructor as context views
-    - refines the Gaussians it predicts with SplatFormer 
+    - subsamples them uniformly
+    - refines the Gaussians it predicts with SplatFormer
     - supervises with photometric loss on both context and test views
 
 An evaluation step is performed once on the same feedforward 
@@ -19,135 +20,29 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import hydra
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 import wandb
 from matplotlib.figure import Figure
 from omegaconf import OmegaConf
 from torch import Generator, Tensor
 from tqdm import tqdm
 
-from anyprune.datasets import DL3DVDataset
+from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import psnr
-from anyprune.models import FrozenAnySplat, FrozenYoNoSplat, SplatFormer
+from anyprune.models import RECONSTRUCTORS, SplatFormer, build_reconstructor
 from anyprune.models.utils import (
     build_splatformer_optimizer, build_splatformer_scheduler,
 )
 from anyprune.training import (
-    BudgetHistogram, PhotometricLoss, fit_budget_fraction, reconstruct,
-    sample_budget_fraction, sample_num_context_views, sample_view_indices,
+    BudgetHistogram, PhotometricLoss, fit_budget_fraction, plan_context_views,
+    reconstruct, sample_budget_fraction, sample_num_context_views,
 )
-from anyprune.utils import set_rng_seed
+from anyprune.utils import load_dotenv, out_of_memory, set_rng_seed
 from anyprune.viz import RefinementBlock, plot_refinement
-
-
-ROOT = Path(__file__).resolve().parent.parent
-
-
-# The feed-forward reconstructors a run can name, as
-# reconstructor.training and reconstructor.validation in
-# configs/train.yaml
-RECONSTRUCTORS = ("AnySplat", "AnySplat-voxelized", "YoNoSplat")
-
-
-def build_reconstructor(cfg, name: str) -> nn.Module:
-    """
-    Build one of RECONSTRUCTORS from the checkpoint the config names.
-
-    Built on demand rather than kept in a table, since each of these is
-    a few GB of weights and a run only ever has one of them on the card
-    at a time.
-    """
-    assert name in RECONSTRUCTORS, (
-        f"Every reconstructor a run names has to be one of "
-        f"{RECONSTRUCTORS}: {name} is not"
-    )
-    if name == "YoNoSplat":
-        return FrozenYoNoSplat(cfg.yonosplat_checkpoint, quiet=True)
-    # The same weights read two ways: the voxelized one fuses the
-    # per-pixel Gaussians onto a grid inside the encoder, which is what
-    # the released checkpoint configures itself for
-    return FrozenAnySplat(
-        cfg.anysplat_checkpoint,
-        quiet=True,
-        voxelize=name == "AnySplat-voxelized",
-    )
-
-
-def load_dotenv():
-    """
-    Read the .env file at the root of the repository, which is where the
-    README asks for the Weights & Biases API key, without pulling in a
-    dependency to do it.
-    """
-    env_file = ROOT / ".env"
-    if not env_file.exists():
-        return
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        os.environ.setdefault(name.strip(), value.strip().strip("'\""))
-
-
-def out_of_memory(error: BaseException) -> bool:
-    """
-    Whether an exception is the card running out of memory.
-
-    torch raises OutOfMemoryError for an allocation it makes itself, but
-    the libraries underneath do not all go through it, and each says so
-    in its own words:
-
-    - spconv, which is most of SplatFormer's backbone, allocates through
-      cumm and reports a plain RuntimeError naming the failure;
-    - cuDNN, which is where the reconstructor's convolutions run, cannot
-      allocate a workspace and reports instead that it could not find an
-      engine to run the computation at all;
-    - cuBLAS reports an allocation status.
-
-    All of them are the same event as far as a step is concerned, and a
-    run that only knows the first dies on the others instead of retrying
-    the step on a smaller share of the prediction. The cuDNN wording is
-    not exclusively about memory - an unsupported configuration says the
-    same thing - but a configuration that has run for hundreds of steps
-    does not become unsupported, so on this path it means the card is
-    full.
-    """
-    if isinstance(error, torch.cuda.OutOfMemoryError):
-        return True
-    if not isinstance(error, RuntimeError):
-        return False
-    message = str(error).lower()
-    return any(
-        wording in message for wording in (
-            "out of memory",
-            "unable to find an engine to execute this computation",
-            "cublas_status_alloc_failed",
-        )
-    )
-
-
-def split_scenes(cfg, num_scenes: int) -> Dict[str, List[int]]:
-    """
-    Divide the scenes between the splits, in the proportions the config
-    names and always the same way.
-    """
-    order = torch.randperm(
-        num_scenes, generator=Generator().manual_seed(cfg.split_seed)
-    ).tolist()
-    splits, first = {}, 0
-    for name, fraction in cfg.splits.items():
-        last = first + round(fraction * num_scenes)
-        splits[name] = order[first:last]
-        first = last
-    # Rounding can leave a scene over, which goes to the training split
-    splits["train"].extend(order[first:])
-    return splits
 
 
 def training_step(
@@ -167,14 +62,11 @@ def training_step(
 ):
     """
     Reconstruct, refine, score and take one optimizer step, returning
-    what the logging needs. Raises on a card that ran out of memory,
-    which the caller retries on a smaller budget.
+    what the logging needs. Raises on a card that ran out of memory.
 
     How much of the prediction is kept comes from `histogram` when there
-    is one, which sends the step wherever the run is short of examples,
-    and from `budget_fraction` when there is not. `budget_scale` is what
-    a retry after an out-of-memory shrinks the step by, and applies
-    whichever of the two decided it.
+    is one and from `budget_fraction` when there is not, scaled either
+    way by `budget_scale`.
     """
     reconstruction = reconstruct(
         reconstructor, scene, context_idx, test_idx,
@@ -245,32 +137,10 @@ def training_step(
 def recover_from_oom(optimizer, scaler):
     """
     Put the optimizer and the loss scaler back into a state a fresh
-    attempt can start from, and hand the memory back.
+    attempt can start from, then collect and hand the memory back.
 
-    The collection is what actually hands it back. A step that runs out
-    of memory does so deep inside its own call stack, and the exception
-    carrying that failure up holds a traceback, which holds those
-    frames, which hold the step's locals: the reconstruction, the
-    refined Gaussians, the renders, and the whole autograd graph behind
-    them. Frames and tracebacks reference each other, so none of it is
-    freed by reference counting when the exception goes out of scope -
-    it waits for the cyclic collector, which knows how many container
-    objects are alive and nothing about the gigabytes of CUDA memory
-    hanging off them, and so has no reason to run. Emptying the cache
-    without collecting first returns nothing, because none of it is
-    free yet.
-
-    Which is what turns one step that did not fit into a run that dies:
-    the graph of the first failure stays resident, so the next step has
-    less to work with, fails in turn, and leaves its own graph behind.
-
-    The scaler tracks where in the step each optimizer is: an OOM
-    between unscale_() and step() leaves it believing this iteration was
-    already unscaled, and the next attempt's unscale_() would refuse.
-    update() is what closes an iteration out. It refuses in turn if
-    there is nothing to close, which is the ordinary case here since
-    most of a step's memory is allocated well before unscale_() is
-    reached, so that refusal is the signal that no cleanup was needed.
+    The scaler is closed out with update(), which refuses when there is
+    no iteration open; that refusal is ignored.
     """
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -292,37 +162,17 @@ def plan_views(
     Sample a run of views from one scene, returning the frames to read
     and the two halves they split into, without reading anything.
 
-    A view count the scene is too short for is lowered to what it does
-    hold, since half the views are held out and a run of 2V frames at
-    this stride has to fit inside the capture: at sixty-four context
-    views that is 128 frames, and two of DL3DV's 541 scenes are shorter
-    than that. Lowering it costs those scenes the top of the view range
-    and keeps them in the run; asserting would end the run on whichever
-    step first drew one of them.
-
-    Kept apart from read_scene() below so that the drawing can stay on
-    the main thread while the reading is handed to a worker.
+    A view count the scene is too short for is lowered to what the
+    scene does hold at this stride.
     """
-    num_frames = dataset.num_frames(scene_idx)
-    # An even number of views, so that the two halves are the same size
-    holds = 2 * (((num_frames - 1) // cfg.view_stride + 1) // 2)
-    num_views = min(2 * num_context_views, holds)
-    assert num_views >= 2, (
-        f"Scene {scene_idx} has {num_frames} frames, too few for a context "
-        f"view and a held-out one at stride {cfg.view_stride}"
-    )
-    return sample_view_indices(
-        num_frames, num_views, stride=cfg.view_stride, generator=generator,
+    return plan_context_views(
+        dataset.num_frames(scene_idx), num_context_views,
+        stride=cfg.view_stride, generator=generator,
     )
 
 
 def read_scene(dataset: DL3DVDataset, scene_idx: int, frames: Tensor):
-    """
-    Read the named frames of a scene off disk, leaving them on the host.
-
-    Nothing here touches CUDA or draws a random number, which is what
-    makes it safe to run on the prefetch thread.
-    """
+    """Read the named frames of a scene off disk, leaving them on the host."""
     return dataset.get_frames(scene_idx, frames)
 
 
@@ -350,14 +200,10 @@ def load_scene(
 class StepPlan:
     """
     Everything one training step draws, before any of it is read or
-    reconstructed.
-
-    The budget is a share rather than a count because the count is not
-    known yet: it depends on how many Gaussians the reconstructor makes
-    of the views drawn here, which is only settled once it has run.
+    reconstructed. The budget is a share of the prediction rather than a
+    count.
     """
     scene_idx: int
-    num_context_views: int
     frames: Tensor
     context_idx: Tensor
     test_idx: Tensor
@@ -372,19 +218,17 @@ def draw_step(
 ) -> StepPlan:
     """
     Draw the scene a step trains on, the views it takes off it and the
-    share of the prediction it keeps, in the order they have always been
-    drawn.
+    share of the prediction it keeps.
     """
     scene_idx = scenes[torch.randint(len(scenes), (1,), generator=generator).item()]
     num_context_views = sample_num_context_views(
-        cfg.context_views.min, cfg.context_views.max, generator=generator
+        cfg.context_views, generator=generator
     )
     frames, context_idx, test_idx = plan_views(
         cfg, dataset, scene_idx, num_context_views, generator
     )
     return StepPlan(
         scene_idx=scene_idx,
-        num_context_views=num_context_views,
         frames=frames,
         context_idx=context_idx,
         test_idx=test_idx,
@@ -396,23 +240,9 @@ def draw_step(
 
 class ScenePrefetcher:
     """
-    Read the frames of the next step while the GPU is still working on
-    this one.
-
-    Reading a step's frames costs about 50 ms of decoding, all of it
-    with the GPU idle, against a step of roughly 1.5 s. One worker is
-    enough to hide it: the read of step n + 1 starts as soon as step n's
-    plan has been drawn and is collected a step later, by which time it
-    has long finished.
-
-    Only the reading moves. Every draw stays on the main thread, in the
-    order draw_step() makes them, so a run is still reproducible from
-    its seed alone. What does change is where those draws fall relative
-    to the Gaussian subsampling inside a step, which comes off the same
-    generator: a step is now planned before the step ahead of it
-    subsamples rather than after. A prefetching run therefore does not
-    repeat a run from before this, step for step, though it draws from
-    the same distribution.
+    Read the frames of the next step on one worker thread while the GPU
+    is still working on this one. Only the reading moves: every draw
+    stays on the main thread, in the order draw_step() makes them.
     """
 
     def __init__(self, dataset: DL3DVDataset, device: torch.device):
@@ -454,11 +284,7 @@ class ScenePrefetcher:
 def refine(
     cfg, splatformer: SplatFormer, gaussians, enable_amp: Optional[bool] = None
 ):
-    """
-    Run SplatFormer over a set of Gaussians, in half precision if asked.
-    The rasterizer downstream is left in single precision, which is what
-    the wrapper hands back whatever it ran in.
-    """
+    """Run SplatFormer over a set of Gaussians, in half precision if asked."""
     with torch.cuda.amp.autocast(
         enabled=cfg.optim.enable_amp if enable_amp is None else enable_amp
     ):
@@ -482,26 +308,13 @@ def refinement_figure(
     saw and of the ones held out from it, against the whole prediction
     they were thinned out of and the ground truth of both.
 
-    The whole prediction is the ceiling the thinning is spending
-    against, so it goes in the figure with its own PSNR and its own
-    count: the gap between it and the thinned row is what the budget
-    cost, and the gap refinement closes is only worth reading next to
-    it. It is left out when the budget was wider than the prediction,
-    since the thinning then returns the same Gaussians and the row would
-    be the row below it drawn twice, and when its render of the held-out
-    views did not fit, since there is then nothing to draw the block
-    below from.
-
-    The held-out renders of the thinned and refined Gaussians, and of
-    the whole prediction, are the ones the pass already took for its
-    metrics, handed in rather than drawn again. What the figure costs
-    over a pass without it, for one scene at one budget: two renders of
-    the context views, and one more of the whole prediction over them,
-    where there was any thinning to show.
-
-    Everything is moved to the host as it is built. What is held onto
-    while the figure is drawn would otherwise be GPU memory the widest
-    budget of the next scene is about to want.
+    The whole prediction goes in with its own PSNR and its own count,
+    and is left out when the budget was wider than the prediction or its
+    render of the held-out views did not fit. The held-out renders of
+    the thinned and refined Gaussians, and of the whole prediction, are
+    the ones the pass already took for its metrics, handed in rather
+    than drawn again; the context views are rendered here. Everything is
+    moved to the host as it is built.
     """
     context, test = reconstruction.context, reconstruction.test
     predicted = reconstruction.gaussians
@@ -571,20 +384,12 @@ def validate(
     they were thinned out of.
 
     A scene is reconstructed once and then thinned down to each budget
-    in turn, so the levels are read off the same prediction. Both the
-    views and the thinning come off a generator seeded by the scene, so
-    a scene is always validated on the same frames and the same
-    Gaussians however far into the run we are and whichever
-    reconstructor produced them.
+    in turn. Both the views and the thinning come off a generator seeded
+    by the scene alone.
 
-    A scene that does not fit is dropped rather than allowed to end the
-    run, the same treatment a training step gets, and for a sharper
-    reason: the budgets swept here run to several times what a step is
-    allowed to draw, so the widest of them are the first thing to
-    overflow on a card the rest of the run fits on. A budget's means are
-    then taken over the scenes that did fit, and a budget no scene fit
-    at is left out of the metrics entirely rather than reported as a
-    number standing on nothing.
+    A scene that does not fit is dropped instead of ending the run. A
+    budget's means are then taken over the scenes that did fit, and a
+    budget no scene fit at is left out of the metrics entirely.
 
     Alongside the metrics come the figures of the first
     validation.num_image_scenes scenes at each of the
@@ -759,28 +564,14 @@ def run_validation(
     dataset: DL3DVDataset,
     scene_indices: Sequence[int],
     step: int,
-    prefix: str = "val",
 ):
     """
     Validate against every reconstructor named in
-    reconstructor.validation and log the result.
-
-    `prefix` is what the metrics are logged under, so that a pass taken
-    on something other than the live weights is charted beside them
-    rather than over them.
+    reconstructor.validation and log the result under `val`.
 
     One reconstructor is on the card at a time: a held-out one is built
     for its pass and thrown away again, and the one being trained
-    against is parked on the host while it is up, since two feed-forward
-    reconstructors and a point transformer do not comfortably share a
-    single consumer GPU. AnySplat and YoNoSplat are about 6 GB of
-    weights between them, which is where a 16 GB card's validation pass
-    went before this: leaving both resident is what put the widest
-    budgets out of reach, not what they are rendering.
-
-    The weights make the trip over PCIe twice per held-out reconstructor
-    per pass, a second or two of a pass that takes minutes, and they are
-    frozen, so nothing is lost by moving them.
+    against is parked on the host while it is up.
     """
     device = next(splatformer.parameters()).device
     # The gradients of the step just taken are still allocated, and are
@@ -804,7 +595,9 @@ def run_validation(
             tqdm.write(f"  building {name} for validation...")
             training_reconstructor.to("cpu")
             torch.cuda.empty_cache()
-            reconstructor = build_reconstructor(cfg, name).to(device)
+            reconstructor = build_reconstructor(
+                name, cfg.anysplat_checkpoint, cfg.yonosplat_checkpoint,
+            ).to(device)
 
         logged = {}
         seen = "trained on" if name == cfg.reconstructor.training else "held out"
@@ -831,14 +624,14 @@ def run_validation(
                     )
                 )
                 tqdm.write(
-                    f"  [{prefix}] {name} ({seen}) from {num_context_views} views at "
+                    f"  [val] {name} ({seen}) from {num_context_views} views at "
                     f"{budget // 1000}k Gaussians: "
                     f"{scores['psnr_input']:.2f} dB in, "
                     f"{scores['psnr_refined']:.2f} dB out, "
                     f"{scores['psnr_gain']:+.2f} dB{whole}{fit}"
                 )
                 logged.update({
-                    f"{prefix}/{name}/{scope}{budget // 1000}k/{key}": scores[key]
+                    f"val/{name}/{scope}{budget // 1000}k/{key}": scores[key]
                     for key in cfg.validation.logged_metrics if key in scores
                 })
             for (scene_idx, image_budget), figure in figures.items():
@@ -847,7 +640,7 @@ def run_validation(
                 # the run rather than walking the scenes and budgets at
                 # one step
                 logged[
-                    f"{prefix}/{name}/views/scene_{scene_idx}/"
+                    f"val/{name}/views/scene_{scene_idx}/"
                     f"{scope}{image_budget // 1000}k"
                 ] = wandb.Image(figure)
                 # wandb has taken its copy by now, and pyplot holds onto
@@ -901,7 +694,7 @@ def main(cfg):
 
     print("Initializing dataset...")
     dataset = DL3DVDataset(cfg.dl3dv_root_dir, cfg.dl3dv_images_subdir)
-    splits = split_scenes(cfg, len(dataset))
+    splits = split_scenes(len(dataset), cfg.splits, cfg.split_seed)
     validation_scenes = splits["val"][:cfg.validation.num_scenes]
     print(
         f"DL3DV initialized with {len(dataset)} scenes: "
@@ -913,7 +706,10 @@ def main(cfg):
         f"Initializing frozen {cfg.reconstructor.training} from pre-trained "
         f"checkpoint..."
     )
-    reconstructor = build_reconstructor(cfg, cfg.reconstructor.training).to(device)
+    reconstructor = build_reconstructor(
+        cfg.reconstructor.training, cfg.anysplat_checkpoint,
+        cfg.yonosplat_checkpoint,
+    ).to(device)
 
     start = (
         "zeroed output heads" if cfg.splatformer.zero_output_heads
@@ -986,10 +782,13 @@ def main(cfg):
             f"A step keeps {cfg.budget.min_fraction:.0%} to "
             f"{cfg.budget.max_fraction:.0%} of what the reconstructor predicts"
         )
+    counts = [str(views) for views in cfg.context_views]
+    drawn = counts[0] if len(counts) == 1 else (
+        ", ".join(counts[:-1]) + " or " + counts[-1]
+    )
     print(
         keeps
-        + f" from {cfg.context_views.min} to "
-        f"{cfg.context_views.max} context views, held under "
+        + f" from {drawn} context views, held under "
         f"{cfg.device_max_gaussians:,} Gaussians, with the loss taken on at "
         f"most {cfg.supervision.max_views} of the '{cfg.supervision.views}' views. "
         f"Validating from "

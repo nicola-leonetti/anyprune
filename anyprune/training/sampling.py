@@ -2,7 +2,7 @@
 Choosing which frames of a scene a training step reconstructs from and
 which it is scored on.
 """
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Generator, Tensor
@@ -37,20 +37,46 @@ def sample_view_indices(
     return frames, sampled[::2], sampled[1::2]
 
 
+def plan_context_views(
+    num_frames: int,
+    num_context_views: int,
+    stride: int = 1,
+    generator: Optional[Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    Sample the run of views a scene of 'num_frames' frames is
+    reconstructed from and scored on, as sample_view_indices() returns
+    them: half of them context views and half held out.
+
+    A count the scene is too short for is lowered to what the scene does
+    hold at this stride, so that a short scene is still measured, just
+    from fewer views than it was asked for.
+    """
+    # An even number of views, so that the two halves are the same size
+    holds = 2 * (((num_frames - 1) // stride + 1) // 2)
+    num_views = min(2 * num_context_views, holds)
+    assert num_views >= 2, (
+        f"A scene of {num_frames} frames is too short for a context view "
+        f"and a held-out one at stride {stride}"
+    )
+    return sample_view_indices(
+        num_frames, num_views, stride=stride, generator=generator,
+    )
+
+
 def sample_num_context_views(
-    minimum: int,
-    maximum: int,
+    choices: Sequence[int],
     generator: Optional[Generator] = None,
 ) -> int:
     """
-    Draw how many context views a step reconstructs from, uniformly
-    between `minimum` and `maximum` inclusive.
+    Draw how many context views a step reconstructs from, uniformly over
+    `choices`.
     """
-    assert 2 <= minimum <= maximum, (
-        f"Need 2 <= minimum <= maximum context views, got {minimum} and {maximum}"
+    assert len(choices) > 0, "Need at least one context view count to draw from"
+    assert all(count >= 2 for count in choices), (
+        f"Every context view count has to be at least 2, got {list(choices)}"
     )
-    span = maximum - minimum + 1
-    return minimum + torch.randint(span, (1,), generator=generator).item()
+    return choices[torch.randint(len(choices), (1,), generator=generator).item()]
 
 
 def sample_budget_fraction(
@@ -99,6 +125,7 @@ def fit_budget_fraction(
 
 __all__ = [
     "fit_budget_fraction",
+    "plan_context_views",
     "sample_budget_fraction",
     "sample_num_context_views",
     "sample_view_indices",
