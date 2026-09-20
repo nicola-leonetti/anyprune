@@ -118,7 +118,10 @@ def fit_budget_fraction(
     upper = min(maximum, max_gaussians / num_predicted)
     lower = min(minimum, upper)
     if maximum == minimum:
-        return upper
+        # One share only, carried onto the ceiling; what a retry after
+        # an out-of-memory scaled it down by is kept, or the retry
+        # would be handed the same field again
+        return upper * fraction / maximum
     position = (fraction - minimum) / (maximum - minimum)
     return lower + (upper - lower) * position
 

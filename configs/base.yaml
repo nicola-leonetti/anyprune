@@ -1,6 +1,25 @@
 # Base configuration shared by all the others (e.g. train, eval)
 seed: 42
 
+# How the scenes are divided between training, validation and test.
+# Defined once here so that training and evaluation cannot disagree on
+# which scenes are held out.
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+split_seed: 0
+
+# Thinning a field to a share f of itself lets a ray through f times as
+# many Gaussians, so it renders too transparent. Raising the opacities to
+# 1 - (1 - a)^(exponent/f) puts that optical depth back before the
+# refiner, and everything that scores it, ever sees the field. Shared by
+# training and evaluation: a checkpoint has to be scored on the kind of
+# field it was trained on, so these have to match between the two.
+compensation:
+  enabled: true
+  exponent: 1.0
+
 anysplat_checkpoint: lhjiang/anysplat
 yonosplat_checkpoint: botaoye/YoNoSplat/dl3dv_224x224_ctx2to32.ckpt
 

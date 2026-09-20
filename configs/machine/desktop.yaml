@@ -8,9 +8,39 @@ outputs_dir: /home/nicola/Desktop/anyprune/outputs
 dl3dv_root_dir: /home/nicola/Desktop/Anysplat-improved/datasets/dl3dv
 dl3dv_images_subdir: images_8
 
-# Loose ceiling on the amount of gaussians the GPU can hold in memory at 
-# training time
-device_max_gaussians: 500_000
+# Loose ceiling on the amount of gaussians the GPU can hold in memory at
+# training time: a step of scripts/train.py with gradient checkpointing,
+# the mask head and the loss on 8 views ran out at 938k on this card
+# (16 GiB) and fit at 914k, so this holds a whole 16-view YoNoSplat
+# prediction (802,816) with some air over it
+device_max_gaussians: 850_000
 
 # How many views to rasterize at once.
 device_max_views_per_render: 2
+
+# A view whose Gaussians cover more tiles than this is rendered and
+# scored in runs of consecutive depth, which bounds the memory a single
+# view takes
+device_max_intersections: 100_000_000
+
+# A training step whose field is at least this many Gaussians moves the
+# frozen reconstructor's weights (3.6 GiB for YoNoSplat in single
+# precision) off the card for the refiner's backward, at about 0.7 s
+# per step for the round trip: with them resident a whole 16-view
+# prediction runs out of memory, without them it peaks at 11-14 GiB
+device_offload_reconstructor_above: 300_000
+
+# What a training step that renders every supervised view in one graph
+# is estimated to peak at, over what is resident: GiB per million
+# refined Gaussians for the refiner's graph and backward, GiB per
+# million Gaussians per supervised view of the reference resolution
+# for the render's (scaled by the pixels of a view), and the margin
+# the estimate has to leave under the card's memory, or the loss is
+# rendered and backpropagated in stages of device_max_views_per_render
+# views instead (see scripts/train.py). Measured 2026-09-20 on this
+# card at 803k Gaussians, 448x448: 12.6 GiB + 0.14 GiB per view; and
+# 8.3 GiB at 500k with 8 views. The constants sit a little over that.
+device_memory_per_million_gaussians_gib: 15.0
+device_memory_per_million_gaussians_per_view_gib: 0.18
+device_memory_view_reference_pixels: 200_704
+device_memory_safety_margin_gib: 1.0

@@ -5,15 +5,12 @@ defaults:
 
 model: splatformer
 
-splits:
-  train: 0.8
-  val: 0.1
-  test: 0.1
-split_seed: 0
-
 # The context view counts a step reconstructs from, one drawn uniformly
-# per step
-context_views: [2, 4, 8, 16, 24, 32, 64]
+# per step. YoNoSplat predicts 50,176 Gaussians per view, so up to 16
+# views the whole prediction fits the backward pass under the card's
+# ceiling (machine/*.yaml) and nothing has to be subsampled (see budget
+# below).
+context_views: [2, 4, 8, 16]
 
 # How far apart along the capture the sampled frames are taken
 view_stride: 1
@@ -27,33 +24,145 @@ supervision:
   # context | test | all
   views: all
   # At most how many of those views the loss is actually taken on, drawn
-  # one per equal stretch of the set
-  max_views: 8
+  # one per equal stretch of the set, or null for every one of them:
+  # the window holds twice the context views, so 4 to 32 of them at the
+  # counts above. A step whose views do not fit the card in one graph
+  # backpropagates them in stages (see scripts/train.py and the
+  # device_memory_* constants of the machine config); at 8 the loss saw
+  # a quarter of a 16-view window.
+  max_views: null
 
 # What share of the Gaussians the reconstructor predicted a step keeps
-# (not used if balance is enabled)
+# (not used if balance is enabled). At 1.0/1.0 with balancing off a
+# step keeps the whole prediction, or what the card holds of it: the
+# count is then the learned rule's call, not a drawn budget.
 budget:
-  min_fraction: 0.1
-  max_fraction: 0.9
+  min_fraction: 1.0
+  max_fraction: 1.0
 
   # In the balancing mechanism the number of gaussians to keep is 
   # decided to keep roughly uniform the histogram of the gaussian counts
   balance:
-    enabled: true
+    enabled: false
     bucket_size: 10_000
     max_gaussians: 500_000
 
+# Off here, over base.yaml: a learned rule is trained and scored on the
+# raw field, and the compensated top-k is what validation measures it
+# against. Evaluation of such a checkpoint has to match.
+compensation:
+  enabled: false
+
+# How a step decides which of the predicted Gaussians the budget keeps,
+# written the way configs/eval.yaml writes its rules: a score and a way
+# of cutting it down. 'uniform' with 'random' is this project's own
+# draw; a measured score ('radsplat', 'mini-splatting',
+# 'mini-splatting-outdoor') renders the field from the context views
+# first, which is what a step then trains the refiner on. With more
+# than one rule a step draws one of them uniformly, so that one
+# checkpoint learns to refine what several rules keep. Validation thins
+# with each rule in turn, since a checkpoint is scored on the kind of
+# field it was trained on.
+pruning:
+  batches_per_pass: 32
+  # At most how many of the context views a score is measured over,
+  # drawn evenly along the capture, or null for every one of them. A
+  # measurement costs about as much as rendering the whole prediction
+  # once per view, which from 64 views is 45 s a step; over 8 of them it
+  # is 6 s, and still finds all but a fraction of a percent of the
+  # Gaussians that ever score. Evaluation measures over every view.
+  max_scoring_views: null
+  # With the budget at the whole prediction this only ever cuts a field
+  # the card cannot hold, keeping the top of the RadSplat score
+  rules:
+    - name: radsplat-top-k
+      score: radsplat
+      selection: top-k
+
+  # The learned rules, which say which of the *refined* Gaussians
+  # survive: switched on by splatformer.mask_head and by
+  # optim.opacity_loss_weight below, either or both.
+  learned:
+    # The RadSplat score is read in logs, floored at eps and centred on
+    # this reference, by the importance input and by the mask head,
+    # whose logit starts at exactly the reference cut. 0.01 is the
+    # threshold of the RadSplat threshold experiment.
+    importance_reference: 0.01
+    importance_eps: 1e-6
+    # A refined Gaussian at or below this opacity is dropped at
+    # inference under the opacity rule; 0.005 is the cut 3DGS itself
+    # prunes at
+    opacity_threshold: 0.005
+    # The Gumbel-Sigmoid temperature of the mask head (LP-3DGS)
+    mask_tau: 0.5
+    # Render the hard cut of the mask in training, with the gradient
+    # through the soft one, so that the loss pays for what inference
+    # drops (see anyprune.training.learned_pruning). Off: rendered
+    # hard, a Gaussian that is cut gets no gradient from the render
+    # (the rasterizer culls it), so the mask only ever shrinks, and did,
+    # to 2% of a 16-view field (2026-09-20); the soft mask hides a cut
+    # of up to 10 dB on dense fields but at least trains.
+    mask_straight_through: false
+    # The way back in for the straight-through mask: the weight of the
+    # mask term is lowered - down to a keep bonus - by a multiplier that
+    # grows by quality_rate per dB per step while the hard cut costs
+    # more than quality_margin_db against the render of the refiner's
+    # input on the step's views, and decays while it costs less, at
+    # most quality_max_multiplier, one per context view count. null
+    # turns it off. With it on (0.5 dB, 0.002, 0.05) the mask swung to
+    # 100% at every count and stuck there, the logits saturated
+    # (2026-09-20); see the module docstring before trying again.
+    quality_margin_db: null
+    quality_rate: 0.002
+    quality_max_multiplier: 0.05
+    # Charge the rule for the damage its render did, per pixel, against
+    # a render of the same views with nothing masked out, rather than
+    # for the error itself, which is mostly the reconstructor's and the
+    # refiner's and which no mask can mend (see
+    # anyprune.training.learned_pruning). weight 0 turns it off. The
+    # reference is 'input' (the field the refiner was handed, which is
+    # what the benchmark measures a pruning against) or 'refined' (the
+    # refined field left whole). against_truth reads the damage as the
+    # per-pixel error increase against the ground truth instead of the
+    # difference of the two renders; the power squares the damage by
+    # default, which weighs the holes pruning leaves.
+    degradation:
+      weight: 0.0
+      reference: input
+      against_truth: false
+      power: 2.0
+    # Put back the optical depth of what the rule drops, by raising the
+    # opacities of what it keeps as compensation.* does for a budget:
+    # softly during training, on the hard cut at inference. Independent
+    # of compensation.enabled, which is about the field handed to the
+    # refiner and has nothing to put back when that is the whole
+    # prediction.
+    compensate: false
+
 reconstructor:
   training: YoNoSplat
-  validation: [YoNoSplat, AnySplat]
+  validation: [YoNoSplat]
 
 splatformer:
   checkpoint: ${checkpoints_dir}/splatformer/train-on-objaverse.pth
   zero_output_heads: false
   gradient_checkpointing: true
+  # Normalize every field by its own statistics in validation too,
+  # rather than by running averages a held-out field lands far from
+  batch_statistics: true
+  # Read the RadSplat score of every Gaussian, measured over the
+  # context views, as a 24th input channel. Off: a wash on 2026-09-19
+  # (within 0.1 dB of the same refiner without it at 2 views), and the
+  # installed checkpoints under checkpoints/anyprune/ were trained
+  # without it, which scripts/eval_learned.py expects (--importance for
+  # one that was)
+  importance_input: false
+  # One more output head, predicting a per-Gaussian keep mask over that
+  # score, trained with optim.mask_loss_weight
+  mask_head: true
 
 optim:
-  total_steps: 2_000
+  total_steps: 1_500
   learning_rates:
     base: 3e-5
     embedding: 3e-5
@@ -64,38 +173,80 @@ optim:
     opacities: 3e-5
     quats: 3e-5
     means: 3e-5
+    # The mask head starts fresh against heads that are already
+    # trained, so it learns at its own rate
+    mask: 1e-3
   lr_schedule: constant
   grad_clip_norm: 2.0
   l1_loss_weight: 1.0
   l2_loss_weight: 0.0
   # Warning: setting this above 0 raises memory usage
-  lpips_loss_weight: 1.0
+  lpips_loss_weight: 0.0
+  # The sparsity terms of the learned rules, each per unit of mean keep
+  # over the field (see anyprune.training.learned_pruning). The opacity
+  # term is off at 0; 3.0 is the weight the notebook of 2026-09-18
+  # settled on, the one that prunes without collapsing the field. The
+  # mask term is only read with splatformer.mask_head on; 0.01 is the
+  # weight the notebook of 2026-09-17 settled on.
+  opacity_loss_weight: 0.0
+  mask_loss_weight: 0.01
   enable_amp: true
 
-  oom_retry_factor: 0.6
+  # A step's loss is divided by what a field of its size has been
+  # costing the run, over the mean over every step, so that the budgets
+  # pull on the weights equally hard instead of the sparse ones pulling
+  # hardest just by having more error left in them. Independent of
+  # budget.balance below: this only reads the size a step ended up on.
+  loss_balance:
+    enabled: false
+    bucket_size: 10_000
+    max_gaussians: 500_000
+    # How far back a bucket's mean looks, in steps that landed in it
+    momentum: 0.9
+    # How far from the run's mean a bucket is allowed to weigh
+    max_ratio: 10.0
+
+  # A step that runs out of memory is retried on this share of its
+  # budget, compounded per retry (0.85, 0.72, 0.61), then given up on:
+  # close enough to the whole field that what it trains on is still
+  # the prediction, and since a whole 16-view field peaks at 12.6-14.6
+  # GiB on a 16 GiB card (15.1 at 90% of the one that did not fit),
+  # one retry is what a scene over the line needs
+  oom_retry_factor: 0.85
   oom_max_retries: 3
 
 validation:
   # Every how many training steps to run validation
-  interval: 500
+  interval: 250
   # How many scenes to run validation on
   num_scenes: 16
-  # The context view counts a pass reconstructs from.
-  context_views: [6]
+  # The context view counts a pass reconstructs from: the two ends of
+  # the training range
+  context_views: [2, 16]
   # At most how many views of a scene a pass renders, of each half,
   # drawn evenly along the capture 
   scored_views: 6
-  gaussian_budgets: [50_000, 100_000, 250_000, 500_000]
+  # One budget, the card's ceiling, so that a pass hands the refiner the
+  # whole prediction and what is kept is the learned rule's call
+  gaussian_budgets: [850_000]
   skip_initial: false
 
   # How many scenes to draw figures of? With what budget?
   num_image_scenes: 5
-  image_budgets: [100_000, 250_000]
+  image_budgets: [850_000]
 
   # How many views of each scene the figure draws, sampled evenly along
   # the trajectory
   image_views: 4
-  logged_metrics: [psnr_refined, psnr_gain, psnr_vs_full]
+  # Every stage a validation field goes through, whole -> thinned ->
+  # compensated (the network's input) -> refined, with the gain each
+  # stage earned, so that a run says where its PSNR at a budget comes
+  # from; then what a learned rule kept and how it fares against the
+  # compensated RadSplat top-k at that count (only logged with a rule on)
+  logged_metrics: [psnr_full, psnr_thinned, psnr_input, psnr_refined,
+                   psnr_compensation_gain, psnr_gain, psnr_vs_full,
+                   psnr_control, psnr_vs_control, kept_fraction,
+                   rule_fraction, scale_ratio, soft_opacity, soft_mask]
 
 wandb:
   project: anyprune
@@ -106,7 +257,7 @@ wandb:
 
 log:
   interval: 10
-  save_interval: 2_000
+  save_interval: 500
   output_dir: ${outputs_dir}/train
 
 # Ask for reproducible cudnn and cublas kernels.

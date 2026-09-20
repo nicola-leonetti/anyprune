@@ -18,6 +18,10 @@ SERIES_COLORS = (
     "#e87ba4", "#008300", "#4a3aa7", "#e34948",
 )
 
+# For the one series that is a reference rather than a contender, such
+# as the whole field every pruned one is measured against.
+REFERENCE_COLOR = "#898781"
+
 # How much room to leave between two blocks of rows, as a fraction of
 # the height of a row.
 BLOCK_GAP = 0.45

@@ -5,19 +5,26 @@ frozen feed-forward reconstructor.
 A training step:
     - samples an even number of frames from one scene
     - hands half of them to the frozen reconstructor as context views
-    - subsamples them uniformly
-    - refines the Gaussians it predicts with SplatFormer
+    - thins the Gaussians it predicts down to a budget, uniformly or by
+      an importance score measured over those context views
+    - refines the Gaussians it predicts with SplatFormer, which can
+      read that score as one more input channel
+    - lets a learned rule say which of the refined Gaussians survive
+      (a sparsity term on their opacities, a mask head, or neither)
     - supervises with photometric loss on both context and test views
+    - divides that loss by what a field of that size usually costs, so
+      that a tight budget and a wide one pull equally hard
 
 An evaluation step is performed once on the same feedforward 
 reconstructor used during training and once with a different one.
 The number of frames for evaluation is fixed.
 """
 import gc
+import math
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
@@ -33,16 +40,164 @@ from tqdm import tqdm
 
 from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import psnr
+from anyprune.gaussians import Gaussians, Pruner, blending_weights, radsplat_score
 from anyprune.models import RECONSTRUCTORS, SplatFormer, build_reconstructor
 from anyprune.models.utils import (
     build_splatformer_optimizer, build_splatformer_scheduler,
 )
 from anyprune.training import (
-    BudgetHistogram, PhotometricLoss, fit_budget_fraction, plan_context_views,
-    reconstruct, sample_budget_fraction, sample_num_context_views,
+    BudgetHistogram, LearnedRule, LossHistogram, PhotometricLoss, Pruned,
+    QualityController, ViewSet, apply_rule, degradation_loss, fit_budget_fraction,
+    plan_context_views, reconstruct,
+    sample_budget_fraction, sample_num_context_views, sparsity_loss,
 )
 from anyprune.utils import load_dotenv, out_of_memory, set_rng_seed
 from anyprune.viz import RefinementBlock, plot_refinement
+
+
+@dataclass
+class StepResult:
+    """What one training step leaves for the logging."""
+    reconstruction: object
+    # The views the loss was taken on, and where each half of the scene
+    # sits in them when neither was thinned away (empty otherwise)
+    views: ViewSet
+    halves: Dict[str, slice]
+    # The render the loss was taken on
+    rendered: Tensor
+    # The loss as the criterion reported it, and its terms
+    loss: float
+    terms: Dict[str, float]
+    budget_fraction: float
+    predicted: int
+    loss_scale: float
+    # What the learned rule made of the refined field, detached
+    pruned: Pruned
+    # What the hard cut cost against the unmasked refined render on the
+    # step's views, in dB, and the weight the mask term was paid at:
+    # only with a QualityController
+    quality_gap: Optional[float] = None
+    mask_weight: Optional[float] = None
+    # How many renders the loss was backpropagated in (1: one graph),
+    # and what the single graph was estimated at, in GiB
+    stages: int = 1
+    memory_estimate: float = 0.0
+
+
+def thin(
+    cfg,
+    gaussians: Gaussians,
+    kept: int,
+    scored: ViewSet,
+    pruner: Pruner,
+    with_score: bool,
+    generator: Optional[Generator] = None,
+) -> Tuple[Gaussians, Optional[Tensor]]:
+    """
+    The `kept` Gaussians of a field `pruner` keeps, ranked over the
+    views `scored`, and their RadSplat scores when `with_score` (None
+    otherwise). A field already that small comes back whole.
+
+    The field is measured once, over the whole prediction, before
+    anything thins it: a measured rule ranks by that sweep and the score
+    the refiner reads is the same sweep's, so that a Gaussian's score is
+    what it carried in the whole field rather than in what was left of
+    it.
+    """
+    measured = None
+    if pruner.measured or with_score:
+        measured = blending_weights(
+            gaussians, scored.poses, scored.intrinsics, scored.image_shape,
+            batches_per_pass=cfg.pruning.batches_per_pass,
+            max_intersections=cfg.device_max_intersections,
+        )
+    score = radsplat_score(measured) if with_score else None
+    if gaussians.num_gaussians <= kept:
+        return gaussians, score
+    index = pruner.order(
+        gaussians, scored.poses, scored.intrinsics, scored.image_shape,
+        generator=generator, measured=measured,
+    )[:kept]
+    return gaussians[index], None if score is None else score[index]
+
+
+def supervision_views(cfg, reconstruction, generator: Generator) -> Tuple[ViewSet, Dict[str, slice]]:
+    """
+    The views a step takes its loss on, and where the context views and
+    the held-out ones sit in them: known when both halves are in and
+    nothing had to be thinned, so that each half can be scored apart,
+    and empty otherwise.
+    """
+    views = reconstruction.views(cfg.supervision.views)
+    limit = cfg.supervision.max_views
+    halves = {}
+    if cfg.supervision.views == "all" and (limit is None or len(views) <= limit):
+        split = len(reconstruction.context)
+        halves = {"context": slice(0, split), "test": slice(split, len(views))}
+    if limit is None:
+        return views, halves
+    return views.thin(limit, generator=generator), halves
+
+
+# What the loss is rendered from, and what a staged backward hands the
+# refiner's graph the gradient of
+RENDER_FIELDS = ("means", "covariances", "harmonics", "opacities")
+
+
+def estimate_single_graph_gib(cfg, num_gaussians: int, num_views: int, image_shape) -> float:
+    """
+    What a step that renders every supervised view in one graph is
+    expected to peak at, in GiB: what is resident now, plus the
+    refiner's graph and backward per million Gaussians, plus the
+    render's per million Gaussians per view, the latter scaled by the
+    pixels of a view against the resolution the constant was measured
+    at (see device_memory_* in the machine config).
+    """
+    resident = torch.cuda.memory_allocated() / 2 ** 30
+    pixels = image_shape[0] * image_shape[1] / cfg.device_memory_view_reference_pixels
+    per_million = (
+        cfg.device_memory_per_million_gaussians_gib
+        + num_views * pixels * cfg.device_memory_per_million_gaussians_per_view_gib
+    )
+    return resident + per_million * num_gaussians / 1e6
+
+
+def single_graph_fits(cfg, num_gaussians: int, num_views: int, image_shape) -> Tuple[bool, float, float]:
+    """
+    Whether the single graph is expected to fit under the card's memory
+    with the configured margin to spare, with the estimate and what the
+    card holds, both in GiB.
+    """
+    estimate = estimate_single_graph_gib(cfg, num_gaussians, num_views, image_shape)
+    total = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+    return estimate + cfg.device_memory_safety_margin_gib <= total, estimate, total
+
+
+def reference_render(cfg, rule: LearnedRule, handed: Gaussians, refined: Gaussians, views: ViewSet) -> Optional[Tensor]:
+    """
+    The render the degradation term measures the rule's against, on
+    these views, out of the graph: the field the refiner was handed or
+    the refined field left whole (see LearnedRule). None with the term
+    off.
+    """
+    if not rule.by_degradation:
+        return None
+    field = refined if rule.degradation_reference == "refined" else handed
+    with torch.no_grad():
+        rendered, _ = field.rasterize(
+            views.poses, views.intrinsics, views.image_shape,
+            views_per_pass=cfg.device_max_views_per_render,
+        )
+    return rendered
+
+
+def chunks(views: ViewSet, size: int):
+    """The views in groups of at most 'size', in order."""
+    for first in range(0, len(views), size):
+        yield ViewSet(
+            views.images[first:first + size], views.poses[first:first + size],
+            views.intrinsics[first:first + size],
+        )
 
 
 def training_step(
@@ -57,17 +212,32 @@ def training_step(
     test_idx: Tensor,
     budget_fraction: float,
     generator: Generator,
+    pruner: Pruner,
+    rule: LearnedRule,
     histogram: Optional[BudgetHistogram] = None,
+    loss_histogram: Optional[LossHistogram] = None,
     budget_scale: float = 1.0,
-):
+    controller: Optional[QualityController] = None,
+) -> StepResult:
     """
     Reconstruct, refine, score and take one optimizer step, returning
     what the logging needs. Raises on a card that ran out of memory.
 
     How much of the prediction is kept comes from `histogram` when there
     is one and from `budget_fraction` when there is not, scaled either
-    way by `budget_scale`.
+    way by `budget_scale`; which of the prediction is kept is `pruner`'s
+    call, read over at most pruning.max_scoring_views of the context
+    views. Which of the refined Gaussians then survive is `rule`'s call,
+    paid for by its sparsity terms on top of the photometric loss.
+
+    When there is a `loss_histogram`, what the step backpropagates is
+    its loss over what a field of its size has been costing the run,
+    while what it reports is the loss itself. The two histograms are
+    independent: either one can be there without the other.
     """
+    # Back on the card if the last step left it off (see below): no
+    # move when it is already there
+    reconstructor.to(scene["images"].device)
     reconstruction = reconstruct(
         reconstructor, scene, context_idx, test_idx,
         generator=generator, context_downscale=cfg.context_downscale,
@@ -105,22 +275,134 @@ def training_step(
         )
     kept = max(kept, 1)
     budget_fraction = kept / predicted
-    reconstruction.gaussians = reconstruction.gaussians.subsample(
-        kept, generator=generator
+    reconstruction.gaussians, score = thin(
+        cfg, reconstruction.gaussians, kept, scoring_views(cfg, reconstruction.context),
+        pruner, splatformer.reads_score, generator=generator,
     )
-    views = reconstruction.views(cfg.supervision.views).thin(
-        cfg.supervision.max_views, generator=generator
+    if cfg.compensation.enabled:
+        # Against the share the field actually came out at rather than
+        # the one that was asked for: a step that kept more than the
+        # reconstructor predicted kept all of it, and has nothing to put
+        # back
+        reconstruction.gaussians = reconstruction.gaussians.compensate(
+            reconstruction.gaussians.num_gaussians / predicted,
+            exponent=cfg.compensation.exponent,
+        )
+    views, halves = supervision_views(cfg, reconstruction, generator)
+
+    # The reconstructor has done its part, and on a field wide enough
+    # its weights are room the backward needs (see
+    # device_offload_reconstructor_above): moved off the card for the
+    # rest of the step. Not moved back here on a failure: a step that
+    # ran out of memory still holds its graph while its frames are
+    # live, and the move back would run out too, so the next step, or
+    # run_validation(), puts it back once the memory is free.
+    offload = (
+        reconstruction.gaussians.num_gaussians >= cfg.device_offload_reconstructor_above
+    )
+    if offload:
+        reconstructor.to("cpu")
+    # Whether every supervised view can be rendered in one graph: the
+    # refiner's graph is most of a step (10 GiB at 800k Gaussians) and
+    # the render adds about 0.14 GiB per 448x448 view on top of it, so
+    # on a wide field with many views the loss is instead rendered and
+    # backpropagated a few views at a time into leaves standing in for
+    # the refined field, and the refiner's graph backpropagated once
+    # from the gradient they accumulate. The same gradient, by the
+    # chain rule, at the memory of one render.
+    fits, memory_estimate, total_memory = single_graph_fits(
+        cfg, reconstruction.gaussians.num_gaussians, len(views), views.image_shape
+    )
+    stage_size = len(views) if fits else cfg.device_max_views_per_render
+    stages = math.ceil(len(views) / stage_size)
+
+    # With a controller, the mask term is paid at the weight the steps
+    # before this one at this view count have set
+    quality_gap = mask_weight = None
+    if controller is not None:
+        mask_weight = controller.weight(len(context_idx))
+    # Read before this step is recorded, out in the loop, so that a
+    # step is weighed against the sizes the run has already seen
+    # and never against itself
+    loss_scale = 1.0 if loss_histogram is None else loss_histogram.scale_of(
+        reconstruction.gaussians.num_gaussians
     )
 
-    refined = refine(cfg, splatformer, reconstruction.gaussians)
-    rendered, _ = refined.rasterize(
-        views.poses, views.intrinsics, views.image_shape,
-        views_per_pass=cfg.device_max_views_per_render,
-    )
-    loss, terms = criterion(rendered, views.images)
-
-    optimizer.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
+    refined, logits = refine(cfg, splatformer, reconstruction.gaussians, score)
+    if stages == 1:
+        pruned = apply_rule(rule, refined, logits, noisy=True)
+        rendered, _ = pruned.trained.rasterize(
+            views.poses, views.intrinsics, views.image_shape,
+            views_per_pass=cfg.device_max_views_per_render,
+        )
+        loss, terms = criterion(rendered, views.images)
+        reference = reference_render(cfg, rule, reconstruction.gaussians, refined, views)
+        if reference is not None:
+            degradation = degradation_loss(rule, rendered, reference, views.images)
+            loss = loss + degradation
+            terms["degradation"] = degradation.item()
+            del reference
+        # One scalar and one backward for both: with non-reentrant
+        # gradient checkpointing the graph is freed by the first
+        sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
+        loss = loss + sparsity
+        terms.update(sparsity_terms)
+        # The terms and the number that goes into the log are the ones
+        # the criterion came back with, which are what a run that does
+        # not normalize logs too and are the only ones comparable
+        # across sizes
+        reported = loss.item()
+        if loss_scale != 1.0:
+            loss = loss / loss_scale
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+    else:
+        # Leaves in place of what the render reads of the refined
+        # field, and of the mask logits: the rule is applied on them,
+        # so that its ops are the one small graph the stages share
+        leaves = {
+            name: getattr(refined, name).detach().requires_grad_(True)
+            for name in RENDER_FIELDS
+        }
+        logits_leaf = None if logits is None else logits.detach().requires_grad_(True)
+        pruned = apply_rule(rule, replace(refined, **leaves), logits_leaf, noisy=True)
+        optimizer.zero_grad(set_to_none=True)
+        rendered_stages, terms, reported = [], {}, 0.0
+        for stage in chunks(views, stage_size):
+            # The mean over every view is the sum of each stage's mean
+            # weighed by its share of the views
+            share = len(stage) / len(views)
+            stage_render, _ = pruned.trained.rasterize(
+                stage.poses, stage.intrinsics, stage.image_shape, views_per_pass=len(stage),
+            )
+            stage_loss, stage_terms = criterion(stage_render, stage.images)
+            reference = reference_render(cfg, rule, reconstruction.gaussians, refined, stage)
+            if reference is not None:
+                degradation = degradation_loss(rule, stage_render, reference, stage.images)
+                stage_loss = stage_loss + degradation
+                stage_terms["degradation"] = degradation.item()
+                del reference
+            # The shared graph above the leaves is kept for the next
+            # stage; the render's own is freed with its outputs
+            scaler.scale(stage_loss * share / loss_scale).backward(retain_graph=True)
+            reported += stage_loss.item() * share
+            for name, value in stage_terms.items():
+                terms[name] = terms.get(name, 0.0) + value * share
+            rendered_stages.append(stage_render.detach())
+            del stage_render, stage_loss
+        sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
+        scaler.scale(sparsity / loss_scale).backward()
+        reported += sparsity.item()
+        terms.update(sparsity_terms)
+        rendered = torch.cat(rendered_stages, dim=0)
+        del rendered_stages
+        # The refiner's graph, once, from what the stages accumulated
+        torch.autograd.backward(
+            [getattr(refined, name) for name in RENDER_FIELDS]
+            + ([] if logits is None else [logits]),
+            [leaves[name].grad for name in RENDER_FIELDS]
+            + ([] if logits is None else [logits_leaf.grad]),
+        )
     if cfg.optim.grad_clip_norm > 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
@@ -128,10 +410,51 @@ def training_step(
         )
     scaler.step(optimizer)
     scaler.update()
-    return (
-        reconstruction, views, rendered.detach(), loss.item(), terms,
-        budget_fraction, predicted,
+    # What the cut cost on these views against the field the refiner
+    # was handed, for the controller: read here, with the graph freed
+    # by the backward, since the whole render of a dense field is a
+    # peak the step cannot afford on top of its activations. Not
+    # against the refined field left whole: rendered hard, the refiner
+    # is free to write anything into the Gaussians it cuts, and did,
+    # so that the whole refined render sat 1-9 dB *under* the cut and
+    # the controller never moved (2026-09-20).
+    if controller is not None:
+        with torch.no_grad():
+            whole, _ = reconstruction.gaussians.rasterize(
+                views.poses, views.intrinsics, views.image_shape,
+                views_per_pass=cfg.device_max_views_per_render,
+            )
+            quality_gap = (
+                psnr(whole.float(), views.images) - psnr(rendered.detach().float(), views.images)
+            ).mean().item()
+            del whole
+        controller.update(len(context_idx), quality_gap)
+    if offload:
+        reconstructor.to(reconstruction.gaussians.device)
+    return StepResult(
+        reconstruction, views, halves, rendered.detach(), reported, terms,
+        budget_fraction, predicted, loss_scale, pruned.detach(),
+        quality_gap, mask_weight, stages, memory_estimate,
     )
+
+
+def scoring_views(cfg, context):
+    """
+    The context views a score is measured over: all of them, or at most
+    pruning.max_scoring_views drawn evenly along the capture, which
+    bounds what a step spends ranking a dense prediction.
+    """
+    limit = cfg.pruning.max_scoring_views
+    if limit is None or len(context) <= limit:
+        return context
+    return context[torch.linspace(0, len(context) - 1, limit).round().long()]
+
+
+def draw_pruner(pruners: Sequence[Pruner], generator: Generator) -> Pruner:
+    """The rule a step thins with, one of the configured ones at random."""
+    if len(pruners) == 1:
+        return pruners[0]
+    return pruners[torch.randint(len(pruners), (1,), generator=generator).item()]
 
 
 def recover_from_oom(optimizer, scaler):
@@ -282,13 +605,37 @@ class ScenePrefetcher:
 
 
 def refine(
-    cfg, splatformer: SplatFormer, gaussians, enable_amp: Optional[bool] = None
-):
-    """Run SplatFormer over a set of Gaussians, in half precision if asked."""
+    cfg,
+    splatformer: SplatFormer,
+    gaussians: Gaussians,
+    score: Optional[Tensor] = None,
+    enable_amp: Optional[bool] = None,
+) -> Tuple[Gaussians, Optional[Tensor]]:
+    """
+    Run SplatFormer over a set of Gaussians, in half precision if asked,
+    returning the refined set and the mask logits when it has a mask
+    head.
+    """
     with torch.cuda.amp.autocast(
         enabled=cfg.optim.enable_amp if enable_amp is None else enable_amp
     ):
-        return splatformer(gaussians)
+        return splatformer.refine(gaussians, score)
+
+
+def control_at(cfg, gaussians: Gaussians, score: Tensor, count: int) -> Gaussians:
+    """
+    What a learned rule is measured against at the count it chose: the
+    top of the RadSplat score, with the optical depth of the thinning
+    put back. Without it a rule that simply keeps more would look better
+    for free.
+    """
+    control = gaussians
+    if gaussians.num_gaussians > count:
+        control = gaussians[torch.topk(score, count, sorted=False).indices]
+    return control.compensate(
+        control.num_gaussians / gaussians.num_gaussians,
+        exponent=cfg.compensation.exponent,
+    )
 
 
 def refinement_figure(
@@ -318,8 +665,9 @@ def refinement_figure(
     """
     context, test = reconstruction.context, reconstruction.test
     predicted = reconstruction.gaussians
-    thinning = (
-        predicted.num_gaussians > thinned.num_gaussians and full_test is not None
+    thinning = full_test is not None and (
+        predicted.num_gaussians > thinned.num_gaussians
+        or refined.num_gaussians < thinned.num_gaussians
     )
 
     def render(gaussians, views) -> Tensor:
@@ -353,7 +701,9 @@ def refinement_figure(
     )
     return plot_refinement(
         blocks,
-        num_gaussians=thinned.num_gaussians,
+        # What is delivered: what was handed over, less what the learned
+        # rule dropped
+        num_gaussians=refined.num_gaussians,
         # What the reconstructor was handed, not what the figure draws:
         # a pass renders at most validation.scored_views of each half,
         # and the count that explains the size of the field is the one
@@ -373,19 +723,41 @@ def validate(
     dataset: DL3DVDataset,
     scene_indices: Sequence[int],
     num_context_views: int,
+    pruner: Pruner,
+    rule: LearnedRule,
 ) -> Tuple[Dict[int, Dict[str, float]], Dict[int, Figure]]:
     """
-    Score the refined Gaussians against the input ones and against the
-    whole prediction on the held-out views of every validation scene, at
-    each of the fixed budgets in validation.gaussian_budgets, and return
-    the three mean PSNRs and the two gains for each: psnr_gain, what
-    refinement won back over the thinned Gaussians, and psnr_vs_full,
-    what the refined Gaussians are worth against the whole prediction
-    they were thinned out of.
+    Score every stage a field goes through on the held-out views of
+    every validation scene, at each of the fixed budgets in
+    validation.gaussian_budgets, and return their mean PSNRs and the
+    gains between them, so that a pass says where the PSNR at a budget
+    comes from:
+        psnr_full      the whole prediction, before any thinning
+        psnr_thinned   the budget's subsample of it, as the rule left it
+        psnr_input     the same after opacity compensation, which is what
+                       the network is handed (the thinned field itself
+                       when compensation is off)
+        psnr_refined   what the network made of it, less what the
+                       learned rule dropped
+    with psnr_compensation_gain what compensation put back over the raw
+    subsample, psnr_gain what refinement added over its input, and
+    psnr_vs_full what the refined field is worth against the whole
+    prediction it was thinned out of.
 
-    A scene is reconstructed once and then thinned down to each budget
-    in turn. Both the views and the thinning come off a generator seeded
-    by the scene alone.
+    With a learned rule on, a pass also says what the rule kept
+    (kept_fraction of the prediction, rule_fraction of what it was
+    handed, the mean soft keep of each term as soft_<term>) and how the
+    refined scales moved (scale_ratio, refined over input, which is
+    where an opacity term goes to be paid when it is not paid in
+    Gaussians); and it measures psnr_control, the compensated RadSplat
+    top-k at exactly the count the rule kept, with psnr_vs_control the
+    rule's gap to it. That control is what makes the rule's number mean
+    something: a rule that simply keeps more would look better for free.
+
+    A scene is reconstructed once, ranked once by `pruner` over its
+    context views, and then thinned down to each budget in turn as a
+    prefix of that order. Both the views and the thinning come off a
+    generator seeded by the scene alone.
 
     A scene that does not fit is dropped instead of ending the run. A
     budget's means are then taken over the scenes that did fit, and a
@@ -401,11 +773,17 @@ def validate(
     device = next(splatformer.parameters()).device
     scores = {
         budget: {
-            "psnr_input": [], "psnr_refined": [],
+            "psnr_thinned": [], "psnr_input": [], "psnr_refined": [],
             "psnr_full": [], "psnr_vs_full": [],
+            "psnr_control": [], "psnr_vs_control": [],
+            "kept_fraction": [], "rule_fraction": [], "scale_ratio": [],
+            "soft_opacity": [], "soft_mask": [],
         }
         for budget in cfg.validation.gaussian_budgets
     }
+    # The score is read by the refiner, or by the control the rule is
+    # measured against
+    with_score = splatformer.reads_score or rule.enabled
     figures: Dict[Tuple[int, int], Figure] = {}
     figure_scenes = set(scene_indices[:cfg.validation.num_image_scenes])
 
@@ -440,6 +818,32 @@ def validate(
             generator=Generator().manual_seed(cfg.split_seed + scene_idx),
         )
         views = reconstruction.test
+        try:
+            scored = scoring_views(cfg, reconstruction.context)
+            measured = None
+            if pruner.measured or with_score:
+                measured = blending_weights(
+                    reconstruction.gaussians,
+                    scored.poses, scored.intrinsics, scored.image_shape,
+                    batches_per_pass=cfg.pruning.batches_per_pass,
+                    max_intersections=cfg.device_max_intersections,
+                )
+            order = pruner.order(
+                reconstruction.gaussians,
+                scored.poses, scored.intrinsics, scored.image_shape,
+                generator=Generator().manual_seed(cfg.split_seed + scene_idx),
+                measured=measured,
+            )
+            score = radsplat_score(measured) if with_score else None
+            del measured
+        except RuntimeError as error:
+            if not out_of_memory(error):
+                raise
+            error.__traceback__ = None
+            del reconstruction
+            torch.cuda.empty_cache()
+            tqdm.write(f"  scene {scene_idx} did not fit being ranked, skipped")
+            continue
         # The whole prediction, rendered once per scene rather than once
         # per budget: it is the ceiling every budget below is spending
         # against, and it is the same render whichever of them is being
@@ -469,27 +873,47 @@ def validate(
             torch.cuda.empty_cache()
 
         for budget in cfg.validation.gaussian_budgets:
-            thinned = refined = rendered = None
+            raw = thinned = refined = rendered = control = None
             try:
-                thinned = reconstruction.gaussians.subsample(
-                    budget,
-                    generator=Generator().manual_seed(
-                        cfg.split_seed + scene_idx
-                    ),
-                )
+                raw = reconstruction.gaussians[order[:budget]]
+                kept_score = None if score is None else score[order[:budget]]
+                thinned = raw
+                if cfg.compensation.enabled:
+                    # Measured as the input too, so that psnr_gain stays
+                    # what the network adds over what it was handed,
+                    # and the raw subsample is kept to be measured on
+                    # its own, so that the pass also says what
+                    # compensation put back
+                    thinned = raw.compensate(
+                        raw.num_gaussians
+                        / reconstruction.gaussians.num_gaussians,
+                        exponent=cfg.compensation.exponent,
+                    )
                 # In single precision whatever training runs in: spconv
                 # takes a different path once a module leaves training
                 # mode, and it has no half-precision kernel to offer there
-                refined = refine(cfg, splatformer, thinned, enable_amp=False)
-                # Held back until both renders are in, so that a budget
-                # that overflows halfway through does not leave the two
+                refined, logits = refine(
+                    cfg, splatformer, thinned, kept_score, enable_amp=False
+                )
+                # What inference delivers: the plain sigmoid's level set,
+                # with no Gumbel noise
+                pruned = apply_rule(rule, refined, logits, noisy=False)
+                refined = pruned.kept
+                # Held back until every render is in, so that a budget
+                # that overflows halfway through does not leave the
                 # PSNRs averaged over different sets of scenes, which
                 # would put a gain between them that no scene measured
                 measured, kept = {}, {}
                 drawing = drawing_scene and budget in cfg.validation.image_budgets
-                for name, gaussians in (
-                    ("psnr_input", thinned), ("psnr_refined", refined)
-                ):
+                stages = [("psnr_input", thinned), ("psnr_refined", refined)]
+                if thinned is not raw:
+                    stages.insert(0, ("psnr_thinned", raw))
+                if rule.enabled:
+                    control = control_at(
+                        cfg, reconstruction.gaussians, score, refined.num_gaussians
+                    )
+                    stages.append(("psnr_control", control))
+                for name, gaussians in stages:
                     rendered, _ = gaussians.rasterize(
                         views.poses, views.intrinsics, views.image_shape,
                         views_per_pass=cfg.device_max_views_per_render,
@@ -497,6 +921,22 @@ def validate(
                     measured[name] = psnr(rendered, views.images).mean().item()
                     if drawing:
                         kept[name] = rendered.cpu()
+                # With nothing to compensate the raw subsample is the
+                # input, and is not rendered twice to say so
+                measured.setdefault("psnr_thinned", measured["psnr_input"])
+                if rule.enabled:
+                    measured.update({
+                        "psnr_vs_control": measured["psnr_refined"] - measured["psnr_control"],
+                        "kept_fraction": refined.num_gaussians / reconstruction.gaussians.num_gaussians,
+                        "rule_fraction": refined.num_gaussians / thinned.num_gaussians,
+                        "scale_ratio": (
+                            pruned.refined.scales.float().mean() / thinned.scales.float().mean()
+                        ).item(),
+                        **{
+                            f"soft_{name}": value.mean().item()
+                            for name, value in pruned.soft.items()
+                        },
+                    })
                 for name, value in measured.items():
                     scores[budget][name].append(value)
                 if psnr_full is not None:
@@ -533,9 +973,9 @@ def validate(
                     f"  scene {scene_idx} did not fit at {budget:,} Gaussians, skipped"
                 )
             finally:
-                del thinned, refined, rendered
+                del raw, thinned, refined, rendered, control
                 torch.cuda.empty_cache()
-        del reconstruction, full_test
+        del reconstruction, full_test, order, score
         torch.cuda.empty_cache()
 
     splatformer.train(was_training)
@@ -551,6 +991,7 @@ def validate(
             name: sum(values) / len(values)
             for name, values in budget_scores.items() if values
         }
+        means["psnr_compensation_gain"] = means["psnr_input"] - means["psnr_thinned"]
         means["psnr_gain"] = means["psnr_refined"] - means["psnr_input"]
         means["num_scenes"] = num_scenes
         metrics[budget] = means
@@ -564,10 +1005,13 @@ def run_validation(
     dataset: DL3DVDataset,
     scene_indices: Sequence[int],
     step: int,
+    pruners: Sequence[Pruner],
+    rule: LearnedRule,
 ):
     """
     Validate against every reconstructor named in
-    reconstructor.validation and log the result under `val`.
+    reconstructor.validation, thinned by each rule of `pruners` in turn,
+    and log the result under `val`.
 
     One reconstructor is on the card at a time: a held-out one is built
     for its pass and thrown away again, and the one being trained
@@ -590,7 +1034,9 @@ def run_validation(
     tqdm.write(f"  before validating: {held()}")
     for name in cfg.reconstructor.validation:
         if name == cfg.reconstructor.training:
-            reconstructor = training_reconstructor
+            # Off the card if the last training step ran out of memory
+            # with it moved off (see training_step)
+            reconstructor = training_reconstructor.to(device)
         else:
             tqdm.write(f"  building {name} for validation...")
             training_reconstructor.to("cpu")
@@ -601,52 +1047,75 @@ def run_validation(
 
         logged = {}
         seen = "trained on" if name == cfg.reconstructor.training else "held out"
-        for position, num_context_views in enumerate(cfg.validation.context_views):
-            # The first view count keeps the plain metric names, which
-            # is what every run before this logged and what
-            # scripts/compare_runs.py reads; the rest are logged under
-            # their own view count beside it
-            scope = "" if position == 0 else f"{num_context_views}v/"
-            metrics, figures = validate(
-                cfg, splatformer, reconstructor, dataset, scene_indices,
-                num_context_views,
-            )
-            for budget, scores in metrics.items():
-                fit = (
-                    "" if scores["num_scenes"] == len(scene_indices)
-                    else f" (over the {scores['num_scenes']} scenes that fit)"
+        for rank, pruner in enumerate(pruners):
+            for position, num_context_views in enumerate(cfg.validation.context_views):
+                # The first rule and the first view count keep the plain
+                # metric names, which is what every run before this
+                # logged and what scripts/compare_runs.py reads; the rest
+                # are logged under their own rule and view count beside it
+                scope = ("" if rank == 0 else f"{pruner.slug}/") + (
+                    "" if position == 0 else f"{num_context_views}v/"
                 )
-                whole = (
-                    "" if "psnr_full" not in scores
-                    else (
-                        f", {scores['psnr_full']:.2f} dB whole "
-                        f"({scores['psnr_vs_full']:+.2f} dB against it)"
+                thinned_by = "" if len(pruners) == 1 else f" by {pruner.name}"
+                metrics, figures = validate(
+                    cfg, splatformer, reconstructor, dataset, scene_indices,
+                    num_context_views, pruner, rule,
+                )
+                for budget, scores in metrics.items():
+                    fit = (
+                        "" if scores["num_scenes"] == len(scene_indices)
+                        else f" (over the {scores['num_scenes']} scenes that fit)"
                     )
-                )
-                tqdm.write(
-                    f"  [val] {name} ({seen}) from {num_context_views} views at "
-                    f"{budget // 1000}k Gaussians: "
-                    f"{scores['psnr_input']:.2f} dB in, "
-                    f"{scores['psnr_refined']:.2f} dB out, "
-                    f"{scores['psnr_gain']:+.2f} dB{whole}{fit}"
-                )
-                logged.update({
-                    f"val/{name}/{scope}{budget // 1000}k/{key}": scores[key]
-                    for key in cfg.validation.logged_metrics if key in scores
-                })
-            for (scene_idx, image_budget), figure in figures.items():
-                # A key of its own per scene, view count and budget, so
-                # that the slider over a run walks one of them through
-                # the run rather than walking the scenes and budgets at
-                # one step
-                logged[
-                    f"val/{name}/views/scene_{scene_idx}/"
-                    f"{scope}{image_budget // 1000}k"
-                ] = wandb.Image(figure)
-                # wandb has taken its copy by now, and pyplot holds onto
-                # every figure it made until it is told not to
-                plt.close(figure)
-            torch.cuda.empty_cache()
+                    # The stages in the order the field goes through
+                    # them, each gain beside the stage that earned it
+                    whole = (
+                        "" if "psnr_full" not in scores
+                        else f"{scores['psnr_full']:.2f} dB whole, "
+                    )
+                    compensated = (
+                        "" if not cfg.compensation.enabled
+                        else (
+                            f"{scores['psnr_input']:.2f} dB compensated "
+                            f"({scores['psnr_compensation_gain']:+.2f}), "
+                        )
+                    )
+                    against = (
+                        "" if "psnr_full" not in scores
+                        else f", {scores['psnr_vs_full']:+.2f} dB against whole"
+                    )
+                    learned = (
+                        "" if not rule.enabled else (
+                            f"; the rule kept {scores['kept_fraction']:.1%} of the "
+                            f"prediction ({scores['rule_fraction']:.1%} of what it was "
+                            f"handed, scales x{scores['scale_ratio']:.2f}), against "
+                            f"{scores['psnr_control']:.2f} dB for the compensated top-k "
+                            f"at that count ({scores['psnr_vs_control']:+.2f})"
+                        )
+                    )
+                    tqdm.write(
+                        f"  [val] {name} ({seen}) from {num_context_views} views "
+                        f"at {budget // 1000}k Gaussians{thinned_by}: {whole}"
+                        f"{scores['psnr_thinned']:.2f} dB thinned, {compensated}"
+                        f"{scores['psnr_refined']:.2f} dB refined "
+                        f"({scores['psnr_gain']:+.2f}){against}{learned}{fit}"
+                    )
+                    logged.update({
+                        f"val/{name}/{scope}{budget // 1000}k/{key}": scores[key]
+                        for key in cfg.validation.logged_metrics if key in scores
+                    })
+                for (scene_idx, image_budget), figure in figures.items():
+                    # A key of its own per scene, rule, view count and
+                    # budget, so that the slider over a run walks one of
+                    # them through the run rather than walking the scenes
+                    # and budgets at one step
+                    logged[
+                        f"val/{name}/views/scene_{scene_idx}/"
+                        f"{scope}{image_budget // 1000}k"
+                    ] = wandb.Image(figure)
+                    # wandb has taken its copy by now, and pyplot holds
+                    # onto every figure it made until it is told not to
+                    plt.close(figure)
+                torch.cuda.empty_cache()
         wandb.log(logged, step=step)
 
         if name != cfg.reconstructor.training:
@@ -683,6 +1152,15 @@ def main(cfg):
         f"Every reconstructor a run names has to be one of "
         f"{RECONSTRUCTORS}: " + ", ".join(sorted(unknown)) + " is not"
     )
+    pruners = [
+        Pruner(**OmegaConf.to_container(rule, resolve=True))
+        for rule in cfg.pruning.rules
+    ]
+    assert pruners, "There is nothing to thin with: no pruning rule is configured"
+    slugs = [pruner.slug for pruner in pruners]
+    assert len(set(slugs)) == len(slugs), (
+        f"Two pruning rules would be logged under the same key: {slugs}"
+    )
     load_dotenv()
     set_rng_seed(cfg.seed, deterministic=cfg.deterministic)
     # TF32 matmuls, which every model here is happy with and none of them
@@ -715,19 +1193,52 @@ def main(cfg):
         "zeroed output heads" if cfg.splatformer.zero_output_heads
         else "its own output heads"
     )
+    additions = [
+        name for name, wanted in (
+            ("the importance score as an input channel", cfg.splatformer.importance_input),
+            ("a mask head", cfg.splatformer.mask_head),
+        ) if wanted
+    ]
     print(
         f"Initializing SplatFormer from {cfg.splatformer.checkpoint} "
-        f"with {start}..."
+        f"with {start}" + (
+            "" if not additions else ", " + " and ".join(additions)
+        ) + "..."
     )
     splatformer = SplatFormer(
         str(cfg.splatformer.checkpoint),
         quiet=True,
         zero_output_heads=cfg.splatformer.zero_output_heads,
         gradient_checkpointing=cfg.splatformer.gradient_checkpointing,
+        batch_statistics=cfg.splatformer.batch_statistics,
+        importance_input=cfg.splatformer.importance_input,
+        mask_head=cfg.splatformer.mask_head,
+        importance_reference=cfg.pruning.learned.importance_reference,
+        importance_eps=cfg.pruning.learned.importance_eps,
     ).to(device)
     splatformer.train()
     trainable = sum(p.numel() for p in splatformer.parameters() if p.requires_grad)
     print(f"SplatFormer has {trainable / 1e6:.1f}M trainable parameters.")
+    rule = LearnedRule(
+        opacity_weight=cfg.optim.opacity_loss_weight,
+        opacity_threshold=cfg.pruning.learned.opacity_threshold,
+        mask=cfg.splatformer.mask_head,
+        mask_weight=cfg.optim.mask_loss_weight,
+        mask_tau=cfg.pruning.learned.mask_tau,
+        mask_straight_through=cfg.pruning.learned.mask_straight_through,
+        quality_margin=cfg.pruning.learned.quality_margin_db,
+        quality_rate=cfg.pruning.learned.quality_rate,
+        quality_max_multiplier=cfg.pruning.learned.quality_max_multiplier,
+        degradation_weight=cfg.pruning.learned.degradation.weight,
+        degradation_reference=cfg.pruning.learned.degradation.reference,
+        degradation_against_truth=cfg.pruning.learned.degradation.against_truth,
+        degradation_power=cfg.pruning.learned.degradation.power,
+        compensate=cfg.pruning.learned.compensate,
+        compensation_exponent=cfg.compensation.exponent,
+    )
+    controller = (
+        QualityController(rule) if rule.mask and rule.quality_margin is not None else None
+    )
 
     criterion = PhotometricLoss(
         l1_weight=cfg.optim.l1_loss_weight,
@@ -763,11 +1274,24 @@ def main(cfg):
     generator = Generator().manual_seed(cfg.seed)
 
     oom_retries = 0
+
+    staged_before = False
     histogram = (
         BudgetHistogram(
             bucket_size=cfg.budget.balance.bucket_size,
             max_gaussians=cfg.budget.balance.max_gaussians,
         ) if cfg.budget.balance.enabled else None
+    )
+    # Its own switch and its own buckets: a run can weigh its losses by
+    # size whether the sizes themselves were balanced, drawn as a share,
+    # or held at one number
+    loss_histogram = (
+        LossHistogram(
+            bucket_size=cfg.optim.loss_balance.bucket_size,
+            max_gaussians=cfg.optim.loss_balance.max_gaussians,
+            momentum=cfg.optim.loss_balance.momentum,
+            max_ratio=cfg.optim.loss_balance.max_ratio,
+        ) if cfg.optim.loss_balance.enabled else None
     )
     if histogram is not None:
         keeps = (
@@ -786,11 +1310,31 @@ def main(cfg):
     drawn = counts[0] if len(counts) == 1 else (
         ", ".join(counts[:-1]) + " or " + counts[-1]
     )
+    if any(pruner.measured for pruner in pruners):
+        over = (
+            "the context views" if cfg.pruning.max_scoring_views is None
+            else f"at most {cfg.pruning.max_scoring_views} of the context views"
+        )
+        keeps += ", chosen " + (
+            "by " if len(pruners) == 1 else "by one of "
+        ) + ", ".join(
+            f"{pruner.name!r} ({pruner.selection} out of the {pruner.score} score)"
+            if pruner.measured else f"{pruner.name!r} (a uniform draw)"
+            for pruner in pruners
+        ) + f" measured over {over},"
     print(
         keeps
         + f" from {drawn} context views, held under "
-        f"{cfg.device_max_gaussians:,} Gaussians, with the loss taken on at "
-        f"most {cfg.supervision.max_views} of the '{cfg.supervision.views}' views. "
+        f"{cfg.device_max_gaussians:,} Gaussians, with the loss taken on "
+        + (
+            f"all of the '{cfg.supervision.views}' views"
+            if cfg.supervision.max_views is None else
+            f"at most {cfg.supervision.max_views} of the '{cfg.supervision.views}' views"
+        )
+        + f", in one graph while its estimate stays "
+        f"{cfg.device_memory_safety_margin_gib:g} GiB under the card's "
+        f"{torch.cuda.get_device_properties(0).total_memory / 2 ** 30:.1f} GiB and in "
+        f"stages of {cfg.device_max_views_per_render} views otherwise. "
         f"Validating from "
         + " and ".join(str(views) for views in cfg.validation.context_views)
         + " context views at "
@@ -799,6 +1343,26 @@ def main(cfg):
         )
         + " Gaussians."
     )
+    if cfg.compensation.enabled:
+        print(
+            f"A thinned field has its opacities raised to "
+            f"1 - (1 - a)^({cfg.compensation.exponent:g}/f) before anything "
+            f"reads it, which puts back the optical depth that keeping a "
+            f"share f of it took out."
+        )
+    if loss_histogram is not None:
+        print(
+            f"A step's loss is divided by what its own bucket of "
+            f"{loss_histogram.bucket_size:,} Gaussians has been costing the "
+            f"run, over the mean over every step, held inside a factor of "
+            f"{loss_histogram.max_ratio:g} either way."
+        )
+    if rule.enabled:
+        print(
+            f"Which of the refined Gaussians survive is the network's call, "
+            f"through {rule.describe()}. Validation measures it against the "
+            f"compensated RadSplat top-k at the count it kept."
+        )
 
     # The frames of a step are read while the step before it is still on
     # the GPU, so the first read has to be started before the loop
@@ -814,7 +1378,7 @@ def main(cfg):
             tqdm.write(f"Validating at step {step}...")
             run_validation(
                 cfg, splatformer, reconstructor, dataset, validation_scenes,
-                step,
+                step, pruners, rule,
             )
 
         no_room = False
@@ -842,6 +1406,7 @@ def main(cfg):
         context_views = len(plan.context_idx)
         context_idx, test_idx = plan.context_idx, plan.test_idx
         budget_fraction = plan.budget_fraction
+        pruner = draw_pruner(pruners, generator)
 
         step_result = None
         # What a retry after an out-of-memory shrinks the step by,
@@ -854,7 +1419,9 @@ def main(cfg):
                 step_result = training_step(
                     cfg, splatformer, reconstructor, criterion, optimizer,
                     scaler, scene, context_idx, test_idx, budget_fraction,
-                    generator, histogram=histogram, budget_scale=budget_scale,
+                    generator, pruner, rule, histogram=histogram,
+                    loss_histogram=loss_histogram, budget_scale=budget_scale,
+                    controller=controller,
                 )
                 break
             except RuntimeError as error:
@@ -882,16 +1449,33 @@ def main(cfg):
         if step_result is None:
             tqdm.write(f"Step {step}: skipped, scene {scene_idx} did not fit")
             continue
-        (
-            reconstruction, views, rendered, loss, terms, budget_fraction,
-            predicted_gaussians,
-        ) = step_result
+        if step_result.stages > 1 and not staged_before:
+            staged_before = True
+            tqdm.write(
+                f"Step {step}: one graph of {step_result.reconstruction.gaussians.num_gaussians:,} "
+                f"Gaussians over {len(step_result.views)} views is estimated at "
+                f"{step_result.memory_estimate:.1f} GiB, within "
+                f"{cfg.device_memory_safety_margin_gib:g} GiB of the card; the loss is "
+                f"rendered and backpropagated in {step_result.stages} stages of "
+                f"{cfg.device_max_views_per_render} views from here on whenever that is so"
+            )
+        reconstruction, views, rendered = (
+            step_result.reconstruction, step_result.views, step_result.rendered
+        )
+        loss, terms, loss_scale = step_result.loss, step_result.terms, step_result.loss_scale
+        budget_fraction, predicted_gaussians = step_result.budget_fraction, step_result.predicted
+        pruned, halves = step_result.pruned, step_result.halves
         # Counted here rather than where the size was chosen, so that a
         # step lands in the bucket it trained on: one that ran out of
         # memory and was retried thinner is an example of the smaller
         # size, and one that never fit at all is not an example at all
         if histogram is not None:
             histogram.record(reconstruction.gaussians.num_gaussians)
+        # Recorded here for the same reason: the loss of a step that was
+        # retried thinner is what that thinner size cost, and a step that
+        # never fit cost nothing that the sizes it was asked for explain
+        if loss_histogram is not None:
+            loss_histogram.record(reconstruction.gaussians.num_gaussians, loss)
         scheduler.step()
 
         if step % cfg.log.interval == 0:
@@ -900,20 +1484,48 @@ def main(cfg):
                     views.poses, views.intrinsics, views.image_shape,
                     views_per_pass=cfg.device_max_views_per_render,
                 )
+                # What the rule would deliver, rendered on the same
+                # views: the render the loss saw is the soft one
+                survivors = rendered
+                if rule.enabled:
+                    survivors, _ = pruned.kept.rasterize(
+                        views.poses, views.intrinsics, views.image_shape,
+                        views_per_pass=cfg.device_max_views_per_render,
+                    )
             # The input render is what the gain is measured against, so
             # it is taken every time it is logged and charted only as
             # that difference
-            psnr_input = psnr(baseline, views.images).mean().item()
-            psnr_refined = psnr(rendered, views.images).mean().item()
+            per_view = {
+                name: psnr(images, views.images)
+                for name, images in (
+                    ("input", baseline), ("refined", rendered), ("pruned", survivors)
+                )
+            }
+            psnr_input = per_view["input"].mean().item()
+            psnr_refined = per_view["refined"].mean().item()
             metrics = {
                 f"train/{name}": value for name, value in terms.items()
             }
+            # Each half of the scene on its own, when both are in whole:
+            # self-reconstruction on the views the reconstructor saw and
+            # novel view synthesis on the ones held out from it
+            metrics.update({
+                f"train/psnr_{name}_{half}": values[part].mean().item()
+                for name, values in per_view.items()
+                for half, part in halves.items()
+            })
             metrics.update({
                 "train/num_gaussians": reconstruction.gaussians.num_gaussians,
                 "train/predicted_gaussians": predicted_gaussians,
                 "train/budget_fraction": budget_fraction,
                 "train/context_views": context_views,
+                "train/pruning_rule": pruners.index(pruner),
                 "train/supervision_views": len(views),
+                # In how many renders the loss was backpropagated, and
+                # what one graph of it was estimated at (see
+                # training_step)
+                "train/backward_stages": step_result.stages,
+                "train/memory_estimate_gib": step_result.memory_estimate,
                 "train/loss": loss,
                 "train/oom_retries": oom_retries,
                 "train/memory_live_gib": torch.cuda.memory_allocated() / 2 ** 30,
@@ -921,6 +1533,42 @@ def main(cfg):
                 "train/psnr_refined": psnr_refined,
                 "train/psnr_gain": psnr_refined - psnr_input,
             })
+            if loss_histogram is not None:
+                metrics.update({
+                    # What the size this step landed on costs against the
+                    # run's mean, and the loss that came of dividing by it:
+                    # a scale that stays at 1 is a run whose budgets are
+                    # not pulling unevenly in the first place
+                    "train/loss_scale": loss_scale,
+                    "train/loss_balanced": loss / loss_scale,
+                })
+            if rule.enabled:
+                num_gaussians = reconstruction.gaussians.num_gaussians
+                metrics.update({
+                    "train/psnr_pruned": per_view["pruned"].mean().item(),
+                    # Of what the refiner was handed, and of the prediction
+                    "train/hard_fraction": pruned.num_kept / num_gaussians,
+                    "train/kept_fraction": pruned.num_kept / predicted_gaussians,
+                    # Whether a sparsity term is being paid in size rather
+                    # than in Gaussians: the same coverage at a lower
+                    # opacity needs a wider footprint
+                    "train/scale_ratio": (
+                        pruned.refined.scales.float().mean()
+                        / reconstruction.gaussians.scales.float().mean()
+                    ).item(),
+                    **{
+                        f"train/soft_{name}": value.mean().item()
+                        for name, value in pruned.soft.items()
+                    },
+                })
+                if step_result.quality_gap is not None:
+                    metrics.update({
+                        # What the cut cost on the step's views, and the
+                        # weight the controller paid the mask term at
+                        # (negative: a bonus for keeping)
+                        "train/quality_gap_db": step_result.quality_gap,
+                        "train/mask_weight": step_result.mask_weight,
+                    })
             if histogram is not None:
                 metrics.update({
                     "train/budget_bucket": histogram.bucket_of(
@@ -936,15 +1584,26 @@ def main(cfg):
                 loss=f"{loss:.4f}",
                 psnr_gain=f"{metrics['train/psnr_gain']:+.2f}",
             )
+            kept = "" if not rule.enabled else (
+                f", {metrics['train/psnr_pruned']:.2f} dB keeping "
+                f"{metrics['train/hard_fraction']:.1%} of them "
+                f"(scales x{metrics['train/scale_ratio']:.2f})"
+            )
             tqdm.write(
                 f"Step {step}: loss {loss:.4f}, "
                 f"PSNR {psnr_input:.2f} -> "
                 f"{psnr_refined:.2f} dB "
                 f"over {reconstruction.gaussians.num_gaussians:,} Gaussians "
                 f"({budget_fraction:.1%} of the "
-                f"{predicted_gaussians:,} predicted) "
-                f"from {context_views} context views, "
-                f"supervised on {len(views)}, peak "
+                f"{predicted_gaussians:,} predicted){kept} "
+                f"from {context_views} context views"
+                + ("" if len(pruners) == 1 else f" by {pruner.name}")
+                + f", supervised on {len(views)}"
+                + (
+                    "" if step_result.stages == 1 else
+                    f" in {step_result.stages} stages ({step_result.memory_estimate:.1f} GiB estimated)"
+                )
+                + f", peak "
                 f"{torch.cuda.max_memory_allocated() / 2 ** 30:.1f} GiB"
             )
 
@@ -953,7 +1612,7 @@ def main(cfg):
             torch.save(splatformer.model.state_dict(), path)
             tqdm.write(f"Wrote {path}")
 
-        del step_result, reconstruction, views, rendered
+        del step_result, reconstruction, views, rendered, pruned
 
     progress.close()
     prefetcher.close()
@@ -964,9 +1623,16 @@ def main(cfg):
             f"of {histogram.bucket_size:,} Gaussians:\n"
             + histogram.summary()
         )
+    if loss_histogram is not None and loss_histogram.total > 0:
+        print(
+            f"The mean loss of each of the {loss_histogram.num_buckets} "
+            f"buckets of {loss_histogram.bucket_size:,} Gaussians, against a "
+            f"mean of {loss_histogram.mean:.4f} over the run:\n"
+            + loss_histogram.summary()
+        )
     run_validation(
         cfg, splatformer, reconstructor, dataset, validation_scenes,
-        cfg.optim.total_steps,
+        cfg.optim.total_steps, pruners, rule,
     )
     torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final.pth")
     wandb.finish()
