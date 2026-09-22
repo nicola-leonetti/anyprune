@@ -51,7 +51,7 @@ answering a question it had already seen.
 """
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import gsplat
 import torch
@@ -136,10 +136,12 @@ def _weights_of_pass(
     Composite one pass' intersections, sorted by ray and then by depth,
     into the weight each of them carries.
 
-    Returns the (M,) weights, the ray each run of them ends on and the
-    share of the light that run leaves behind, which is what the caller
-    multiplies the running transmittance of those rays by before it asks
-    for the next pass.
+    Returns the (M,) weights, the (M,) share of the light that reached
+    each intersection (its transmittance, what the weight is the alpha
+    times), the ray each run of them ends on and the share of the light
+    that run leaves behind, which is what the caller multiplies the
+    running transmittance of those rays by before it asks for the next
+    pass.
 
     The product of (1 - alpha) in front of an intersection is taken in
     logs, as a cumulative sum with the sum up to the start of its ray
@@ -160,17 +162,36 @@ def _weights_of_pass(
     base = (running - kept)[starts]
     # What the Gaussians in front of it on this ray left, times what
     # every earlier pass left of the ray
-    in_front = torch.exp(running - kept - base[ray_of_run]).float()
-    weights = alphas * in_front * transmittance[rays]
+    in_front = torch.exp(running - kept - base[ray_of_run]).float() * transmittance[rays]
+    weights = alphas * in_front
 
     ends = torch.zeros_like(starts)
     ends[:-1] = starts[1:]
     ends[-1] = True
-    return weights, rays[ends], torch.exp(running[ends] - base).float()
+    return weights, in_front, rays[ends], torch.exp(running[ends] - base).float()
+
+
+@dataclass
+class Pass:
+    """
+    One pass of a sweep over a view: every (Gaussian, ray) intersection
+    the rasterizer walked in it, sorted by ray and by depth within a
+    ray, with what each one carries. Every array is (M,).
+    """
+    view: int
+    # (N, 2) and (N, 3): where the view projects each Gaussian's mean
+    # to, in pixels, and the conic it projects to
+    means2d: Tensor
+    conics: Tensor
+    gaussian_ids: Tensor  # into the field
+    rays: Tensor          # pixel index, y * width + x
+    alphas: Tensor        # the rasterizer's alpha at the pixel's centre
+    transmittance: Tensor # what reached it: the product of (1 - alpha) in front
+    weights: Tensor       # alphas * transmittance
 
 
 @torch.no_grad()
-def blending_weights(
+def sweep(
     gaussians: Gaussians,
     poses: Tensor,
     intrinsics: Tensor,
@@ -179,24 +200,23 @@ def blending_weights(
     far_plane: float = 1e10,
     batches_per_pass: int = _BATCHES_PER_PASS,
     max_intersections: Optional[int] = None,
-) -> BlendingWeights:
+) -> Iterator[Pass]:
     """
-    Render the field from every one of V views and gather what each
-    Gaussian contributed to it, without keeping any of the renders.
-
-    The views are given the way Gaussians.rasterize() takes them, and
-    are rendered one at a time: a sweep only ever holds the
-    intersections of a single view, which is what lets it run over a
-    whole prediction rather than over a field already thinned to fit.
-    'max_intersections' bounds even that, the way it does in
-    Gaussians.rasterize(): a view covering more tiles than it is swept
-    as runs of consecutive depth, front to back, carrying the
+    Walk every one of V views the way the rasterizer renders it, front
+    to back, and yield what each pass of it composited, without keeping
+    any render. The views are given the way Gaussians.rasterize() takes
+    them and are walked one at a time, so a sweep only ever holds the
+    intersections of a single pass of a single view, which is what lets
+    it run over a whole prediction rather than over a field already
+    thinned to fit. 'max_intersections' bounds even that, the way it
+    does in Gaussians.rasterize(): a view covering more tiles than it
+    is walked as runs of consecutive depth, front to back, carrying the
     transmittance from one run to the next.
 
-    The weights are the ones the rasterizer itself composites, down to
-    where it clamps an alpha and where it stops walking a pixel that has
-    gone opaque, so a Gaussian the renders never showed scores zero
-    here.
+    The alphas and weights are the ones the rasterizer itself
+    composites, down to where it clamps an alpha and where it stops
+    walking a pixel that has gone opaque, so a Gaussian the renders
+    never showed is never yielded.
     """
     assert gaussians.means.is_cuda, \
         "gsplat's rasterizer is CUDA only, move the Gaussians to a GPU first"
@@ -204,7 +224,6 @@ def blending_weights(
         f"A pass has to composite at least one batch, got {batches_per_pass}"
     )
     device = gaussians.device
-    num_gaussians = gaussians.num_gaussians
     height, width = image_shape
 
     poses = poses.reshape(-1, 4, 4).to(gaussians.means)
@@ -225,12 +244,6 @@ def blending_weights(
     # an over-confident field stop growing
     opacities = gaussians.opacities.float().clamp(0.0, 1.0)
 
-    measured = BlendingWeights(
-        peak=torch.zeros(num_gaussians, device=device),
-        total=torch.zeros(num_gaussians, device=device),
-        density=torch.zeros(num_gaussians, device=device),
-        peaked=torch.zeros(num_gaussians, dtype=torch.bool, device=device),
-    )
     tile_width = math.ceil(width / _TILE_SIZE)
     tile_height = math.ceil(height / _TILE_SIZE)
     batch_size = _TILE_SIZE * _TILE_SIZE
@@ -251,13 +264,6 @@ def blending_weights(
             )
 
         transmittance = torch.ones(1, height, width, device=device)
-        view_total = torch.zeros(num_gaussians, device=device)
-        # The largest weight each ray has seen so far and who carried
-        # it, packed into one integer so that a single scatter answers
-        # both: the bits of a non-negative float sort the way the float
-        # does, so the maximum over a ray of (weight, index) is the
-        # index of its maximum weight.
-        ray_peak = torch.zeros(height * width, dtype=torch.int64, device=device)
 
         for run in runs:
             run_means2d = means2d[:, run].contiguous()
@@ -322,41 +328,89 @@ def blending_weights(
                 gaussian_ids, rays, alphas = (
                     gaussian_ids[order], rays[order], alphas[order]
                 )
-                weights, ends, left = _weights_of_pass(
+                weights, in_front, ends, left = _weights_of_pass(
                     alphas, rays, transmittance.reshape(-1)
                 )
                 # Back from the run's own numbering to the field's
                 if isinstance(run, Tensor):
                     gaussian_ids = run[gaussian_ids]
 
-                view_total.index_add_(0, gaussian_ids, weights)
-                measured.peak.scatter_reduce_(
-                    0, gaussian_ids, weights, reduce="amax"
-                )
-                ray_peak.scatter_reduce_(
-                    0, rays,
-                    (weights.contiguous().view(torch.int32).long() << 32)
-                    | gaussian_ids,
-                    reduce="amax",
-                )
+                yield Pass(view, means2d[0], conics[0], gaussian_ids, rays, alphas, in_front, weights)
+
                 # What this pass left of each ray it touched, for the
                 # next one to start from
                 flat = transmittance.reshape(-1)
                 flat[ends] = flat[ends] * left
             del isect_ids, flatten_ids, isect_offsets
 
+
+@torch.no_grad()
+def blending_weights(
+    gaussians: Gaussians,
+    poses: Tensor,
+    intrinsics: Tensor,
+    image_shape: Tuple[int, int],
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    batches_per_pass: int = _BATCHES_PER_PASS,
+    max_intersections: Optional[int] = None,
+) -> BlendingWeights:
+    """
+    Render the field from every one of V views and gather what each
+    Gaussian contributed to it, without keeping any of the renders: a
+    sweep() reduced to the four numbers the scores above are written
+    out of. A Gaussian the renders never showed scores zero here.
+    """
+    device = gaussians.device
+    num_gaussians = gaussians.num_gaussians
+    height, width = image_shape
+    measured = BlendingWeights(
+        peak=torch.zeros(num_gaussians, device=device),
+        total=torch.zeros(num_gaussians, device=device),
+        density=torch.zeros(num_gaussians, device=device),
+        peaked=torch.zeros(num_gaussians, dtype=torch.bool, device=device),
+    )
+
+    current = None
+    view_total = ray_peak = conics = None
+
+    def close_view():
         # A ray whose largest weight is zero was never actually stopped
         # by anything, and the low half of its entry is a Gaussian index
         # that never carried any weight
         peaked = ray_peak[ray_peak >= (1 << 32)] & 0xFFFFFFFF
         view_peaked = torch.zeros_like(measured.peaked)
         view_peaked[peaked] = True
-
         measured.total += view_total
         measured.peaked |= view_peaked
         measured.density += torch.where(
-            view_peaked, view_total / _projected_areas(conics)[0], 0.0
+            view_peaked, view_total / _projected_areas(conics), 0.0
         )
+
+    for it in sweep(
+        gaussians, poses, intrinsics, image_shape, near_plane, far_plane,
+        batches_per_pass, max_intersections,
+    ):
+        if it.view != current:
+            if current is not None:
+                close_view()
+            current, conics = it.view, it.conics
+            view_total = torch.zeros(num_gaussians, device=device)
+            # The largest weight each ray has seen so far and who
+            # carried it, packed into one integer so that a single
+            # scatter answers both: the bits of a non-negative float
+            # sort the way the float does, so the maximum over a ray of
+            # (weight, index) is the index of its maximum weight.
+            ray_peak = torch.zeros(height * width, dtype=torch.int64, device=device)
+        view_total.index_add_(0, it.gaussian_ids, it.weights)
+        measured.peak.scatter_reduce_(0, it.gaussian_ids, it.weights, reduce="amax")
+        ray_peak.scatter_reduce_(
+            0, it.rays,
+            (it.weights.contiguous().view(torch.int32).long() << 32) | it.gaussian_ids,
+            reduce="amax",
+        )
+    if current is not None:
+        close_view()
     return measured
 
 
@@ -424,10 +478,12 @@ def importance_score(
 __all__ = [
     "BlendingWeights",
     "MEASURED_SCORES",
+    "Pass",
     "SCORES",
     "blending_weights",
     "importance_score",
     "mini_splatting_score",
     "radsplat_score",
     "score_of",
+    "sweep",
 ]

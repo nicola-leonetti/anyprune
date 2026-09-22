@@ -83,11 +83,22 @@ pruning:
   # survive: switched on by splatformer.mask_head and by
   # optim.opacity_loss_weight below, either or both.
   learned:
-    # The RadSplat score is read in logs, floored at eps and centred on
-    # this reference, by the importance input and by the mask head,
-    # whose logit starts at exactly the reference cut. 0.01 is the
-    # threshold of the RadSplat threshold experiment.
-    importance_reference: 0.01
+    # The score the learned rules read: 'radsplat' (the peak blending
+    # weight) or 'speedy-splat' (the sensitivity of
+    # anyprune.gaussians.sensitivity, about twice the sweep to measure).
+    # A field over the card's ceiling is cut by this same score.
+    # Speedy-Splat since 2026-09-22: the mask trained on it beats the
+    # one trained on RadSplat's on every metric at every count (2-24
+    # views), by 0.2-1.4 dB, with a wider margin over the count-matched
+    # top-k (+0.9 to +1.7 dB from 8 views against +0.1 to +1.1).
+    score: speedy-splat
+    # The score is read in logs, floored at eps and centred on this
+    # reference, by the importance input and by the mask head, whose
+    # logit starts at exactly the reference cut. 0.01 is the threshold
+    # of the RadSplat threshold experiment for 'radsplat'; 0.0125 keeps
+    # about the same count of 'speedy-splat' (probed 2026-09-21 on 2-16
+    # views).
+    importance_reference: 0.0125
     importance_eps: 1e-6
     # A refined Gaussian at or below this opacity is dropped at
     # inference under the opacity rule; 0.005 is the cut 3DGS itself
@@ -127,7 +138,12 @@ pruning:
     # difference of the two renders; the power squares the damage by
     # default, which weighs the holes pruning leaves.
     degradation:
-      weight: 0.0
+      # 2.0 since 2026-09-21: a fraction knob more than a better rule
+      # (the count-matched top-k climbs with it), but the balanced
+      # point of the 1/2/5/10 sweep, +0.3-0.6 dB on every metric for 3-6
+      # points more of the field kept, with most of the selection
+      # margin over the top-k intact
+      weight: 2.0
       reference: input
       against_truth: false
       power: 2.0

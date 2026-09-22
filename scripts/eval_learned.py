@@ -14,30 +14,38 @@ frames, alternating context and test frames; at each view count the
 generator predicts a field from the first frames of the window, and
 every method is scored on the context views (self-reconstruction) and
 on the test views between them (novel view synthesis), on PSNR, SSIM
-and LPIPS. The methods, in the order of the figure:
+and LPIPS. The methods:
 
     full field                                  the whole prediction
-    learned mask + SplatFormer                  the mask, as refined
+    learned mask (<label>) + SplatFormer        each mask of --masks, as
+                                                refined, at its own count
     above t=0.01 + compensation                 the RadSplat threshold,
                                                 at its own count
-    top-k + compensation                        the top of the score at
-                                                the learned mask's count
-    top-k + compensation + SplatFormer          the same, through a
-                                                refiner trained on
-                                                compensated top-k fields
+    <score> top-k + compensation                the top of each score of
+                                                --baseline-scores (RadSplat,
+                                                Speedy-Splat, PUP 3D-GS)
+                                                at the first mask's count
+    <score> top-k + compensation + SplatFormer  the same, through the
+                                                refiner trained on such
+                                                fields (--topk-checkpoints)
+    ... + post-optimization                     any of the above after
+                                                --post-optimize steps of
+                                                per-scene 3DGS optimization
+                                                on the context views
+                                                (anyprune.gaussians.optimization)
+    <score> top-k + compensation [at X's count] the raw top of a second
+                                                mask's own score at its count
 
-and, only when --compensated-checkpoint names one, the mask whose
-survivors are compensated by the share kept and which was trained that
-way (pruning.learned.compensate). The refiners were trained by
-scripts/train.py on fields from 2, 4, 8 and 16 context views, drawn at
-random per step, with the loss on every view of the window, for the
-same number of steps (see configs/train.yaml), and are read from
-checkpoints/anyprune/ unless named on the command line; the view counts
-above 16 say how they generalize to fields they were never trained on. A field wider than
-the card holds is cut to the top of the score before a refiner sees it,
-the way the protocol does. The counts are run from the fewest views up,
-each over every scene, and the sweep stops at the first count no scene
-fits.
+The refiners were trained by scripts/train.py on fields from 2, 4, 8
+and 16 context views, drawn at random per step, with the loss on every
+view of the window, for the same number of steps (see
+configs/train.yaml), and are read from checkpoints/anyprune/ unless
+named on the command line; the view counts above 16 say how they
+generalize to fields they were never trained on. A field wider than the
+card holds is cut to the top of the mask's score before a refiner sees
+it, the way the protocol does. The counts are run from the fewest views
+up, each over every scene, and the sweep stops at the first count no
+scene fits.
 
     python scripts/eval_learned.py
 
@@ -56,6 +64,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,7 +83,10 @@ from tqdm import tqdm
 
 from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import LPIPS, psnr, ssim
-from anyprune.gaussians import Gaussians, blending_weights, radsplat_score
+from anyprune.gaussians import (
+    Gaussians, blending_weights, fine_tune, pup_score, radsplat_score, sensitivity_scores,
+    speedy_splat_score,
+)
 from anyprune.models import SplatFormer, build_reconstructor
 from anyprune.training import LearnedRule, Pruned, Reconstruction, ViewSet, apply_rule, reconstruct, sample_view_indices
 from anyprune.utils import load_dotenv, out_of_memory, set_rng_seed
@@ -112,7 +124,14 @@ THRESHOLD = IMPORTANCE_REFERENCE
 # --- The refiners, trained by scripts/train.py at 2-16 views with the
 # loss on every view of the window (the -2-16v.pth ones without the
 # suffix saw at most 8 of them) ---
-LEARNED_CHECKPOINT = CHECKPOINTS_DIR / "anyprune" / "learned-mask-2-16v-allviews.pth"
+# Trained with the degradation term at weight 2 reading Speedy-Splat's
+# sensitivity (configs/train.yaml), whose reference keeps about the
+# same count as RadSplat's 0.01
+LEARNED_CHECKPOINT = CHECKPOINTS_DIR / "anyprune" / "learned-mask-2-16v-deg2.0-speedy.pth"
+SPEEDY_IMPORTANCE_REFERENCE = 0.0125
+# The same recipe reading the RadSplat score (pruning.learned.score),
+# 0.2-1.4 dB under it (2026-09-22)
+RADSPLAT_LEARNED_CHECKPOINT = CHECKPOINTS_DIR / "anyprune" / "learned-mask-2-16v-deg2.0-input-p2.0.pth"
 # The compensated mask, checkpoints/anyprune/learned-mask-compensated-2v.pth
 # (trained at 2 views only), is scored only when asked for on the
 # command line
@@ -129,25 +148,57 @@ WANDB_PROJECT = "anyprune"
 # ---------------------------------------------------------------------
 
 METHOD_FULL = "full field"
-METHOD_LEARNED_COMP = "learned mask + compensation + SplatFormer"
-METHOD_LEARNED = "learned mask + SplatFormer"
 METHOD_THRESHOLD_COMP = f"above t={THRESHOLD:g} + compensation"
-METHOD_TOPK_COMP = "top-k + compensation"
-METHOD_TOPK_COMP_REFINED = "top-k + compensation + SplatFormer"
-METHODS = [
-    METHOD_FULL, METHOD_LEARNED_COMP, METHOD_LEARNED, METHOD_THRESHOLD_COMP,
-    METHOD_TOPK_COMP, METHOD_TOPK_COMP_REFINED,
-]
-# The bars of the figure, as scripts/eval.py styles its own: a hue per
-# rule, hatched when refined, and a neutral bar for the whole field
-STYLES = [
-    (METHOD_FULL, REFERENCE_COLOR, None),
-    (METHOD_LEARNED_COMP, SERIES_COLORS[4], "//"),
-    (METHOD_LEARNED, SERIES_COLORS[2], "//"),
-    (METHOD_THRESHOLD_COMP, SERIES_COLORS[1], None),
-    (METHOD_TOPK_COMP, SERIES_COLORS[3], None),
-    (METHOD_TOPK_COMP_REFINED, SERIES_COLORS[3], "//"),
-]
+# The scores a non-learned top-k is cut by, the label each is reported
+# under and the colour of its bars: RadSplat's peak blending weight and
+# the two sensitivities of Hanson et al. (anyprune.gaussians.sensitivity),
+# whose papers prune an optimized scene and fine-tune it, which is what
+# the post-optimization rows do to a predicted field
+SCORES = {
+    "radsplat": ("RadSplat", SERIES_COLORS[3]),
+    "speedy-splat": ("Speedy-Splat", SERIES_COLORS[0]),
+    "pup": ("PUP 3D-GS", SERIES_COLORS[6]),
+}
+SUFFIX_REFINED = " + SplatFormer"
+SUFFIX_OPTIMIZED = " + post-optimization"
+MASK_COLORS = [SERIES_COLORS[2], SERIES_COLORS[5], SERIES_COLORS[4], SERIES_COLORS[1]]
+
+
+@dataclass
+class LearnedMask:
+    """A learned mask refiner under test, with the score its mask head reads."""
+    label: str
+    checkpoint: Path
+    score: str
+    reference: float
+    model: Optional[SplatFormer] = None
+
+    @property
+    def method(self) -> str:
+        return f"learned mask ({self.label}){SUFFIX_REFINED}"
+
+
+def method_topk(score: str, suffix: str = "", at: Optional[str] = None) -> str:
+    """The row of a top-k by 'score', compensated, with what came after and whose count it was cut at."""
+    return f"{SCORES[score][0]} top-k + compensation{suffix}" + ("" if at is None else f" [at {at}'s count]")
+
+
+def style_of(method: str, masks: Sequence[LearnedMask]):
+    """(label, colour, hatch) of a method's bars: a hue per rule, hatched when refined or optimized."""
+    hatch = "xx" if SUFFIX_OPTIMIZED in method else ("//" if SUFFIX_REFINED in method else None)
+    if method == METHOD_FULL:
+        return method, REFERENCE_COLOR, None
+    if method == METHOD_THRESHOLD_COMP:
+        return method, SERIES_COLORS[1], None
+    for i, mask in enumerate(masks):
+        if method.startswith(f"learned mask ({mask.label})"):
+            return method, MASK_COLORS[i % len(MASK_COLORS)], hatch
+    for score, (label, color) in SCORES.items():
+        if method.startswith(label):
+            return method, color, hatch
+    return method, SERIES_COLORS[7 % len(SERIES_COLORS)], hatch
+
+
 METRICS = (("psnr", "PSNR (dB)"), ("ssim", "SSIM"), ("lpips", "LPIPS"))
 BLOCKS = (("self", "context"), ("nvs", "test"))
 AVERAGED = ("num_gaussians", "predicted_gaussians") + tuple(
@@ -162,11 +213,14 @@ def build_rule(compensate: bool) -> LearnedRule:
     )
 
 
-def build_refiner(checkpoint: Path, device: torch.device, mask_head: bool, importance: bool) -> SplatFormer:
+def build_refiner(
+    checkpoint: Path, device: torch.device, mask_head: bool, importance: bool,
+    reference: float = IMPORTANCE_REFERENCE,
+) -> SplatFormer:
     return SplatFormer(
         str(checkpoint), quiet=True, batch_statistics=REFINER_BATCH_STATISTICS,
         importance_input=importance, mask_head=mask_head,
-        importance_reference=IMPORTANCE_REFERENCE, importance_eps=IMPORTANCE_EPS,
+        importance_reference=reference, importance_eps=IMPORTANCE_EPS,
     ).to(device).eval()
 
 
@@ -213,92 +267,140 @@ def compensated(gaussians: Gaussians, predicted: int) -> Gaussians:
     return gaussians.compensate(gaussians.num_gaussians / predicted, exponent=COMPENSATION_EXPONENT)
 
 
-@torch.no_grad()
+def measure_scores(field: Gaussians, context: ViewSet, which: Sequence[str]) -> Dict[str, Tensor]:
+    """
+    The scores named in 'which' (keys of SCORES), each one number per
+    Gaussian, measured over the context views: one sweep for RadSplat's
+    and one more for the sensitivities, the Fisher only when PUP's is
+    asked for.
+    """
+    scores = {}
+    kwargs = dict(batches_per_pass=PRUNING_BATCHES_PER_PASS, max_intersections=DEVICE_MAX_INTERSECTIONS)
+    if "radsplat" in which:
+        measured = blending_weights(field, context.poses, context.intrinsics, context.image_shape, **kwargs)
+        scores["radsplat"] = radsplat_score(measured)
+        del measured
+    if "speedy-splat" in which or "pup" in which:
+        sensitivities = sensitivity_scores(
+            field, context.poses, context.intrinsics, context.image_shape, fisher="pup" in which, **kwargs,
+        )
+        if "speedy-splat" in which:
+            scores["speedy-splat"] = speedy_splat_score(sensitivities)
+        if "pup" in which:
+            scores["pup"] = pup_score(sensitivities)
+        del sensitivities
+    return scores
+
+
 def evaluate_scene(
-    learned: SplatFormer, learned_comp: Optional[SplatFormer], topk_refiner: Optional[SplatFormer],
-    scorer: Scorer, reconstructor, scene, context_idx, test_idx,
+    masks: Sequence[LearnedMask], baseline_scores: Sequence[str], topk_refiners: Dict[str, SplatFormer],
+    post_steps: int, scorer: Scorer, reconstructor, scene, context_idx, test_idx, scene_idx: int,
+    full_post_optimization: bool = False,
 ) -> List[dict]:
     """
-    Every method on one scene at one view count, off a single sweep of
-    the field over the context views. The top-k controls are cut at
-    exactly the count the learned mask (as refined, without
-    compensation) kept; the threshold keeps whatever scores above it.
+    Every method on one scene at one view count. The first mask is the
+    primary one: every baseline is cut at the count it kept (as refined,
+    without compensation), raw, through the refiner trained on such
+    fields when there is one for its score, and after post_steps of
+    per-scene optimization when asked for; every other mask is scored
+    at its own count against the raw top-k of its own score there. The
+    threshold keeps whatever scores above it.
     """
-    reconstruction = reconstruct(reconstructor, scene, context_idx, test_idx)
-    field, context = reconstruction.gaussians, reconstruction.context
-    predicted = field.num_gaussians
-    measured = blending_weights(
-        field, context.poses, context.intrinsics, context.image_shape,
-        batches_per_pass=PRUNING_BATCHES_PER_PASS, max_intersections=DEVICE_MAX_INTERSECTIONS,
-    )
-    score = radsplat_score(measured)
-    del measured
-    above = int((score >= THRESHOLD).sum().item())
+    with torch.no_grad():
+        reconstruction = reconstruct(reconstructor, scene, context_idx, test_idx)
+        field, context = reconstruction.gaussians, reconstruction.context
+        predicted = field.num_gaussians
+        scores = measure_scores(
+            field, context, set(baseline_scores) | {mask.score for mask in masks} | {"radsplat"},
+        )
+    above = int((scores["radsplat"] >= THRESHOLD).sum().item())
+
+    def optimized(name: str, gaussians: Gaussians) -> dict:
+        tuned = fine_tune(
+            gaussians, context.poses, context.intrinsics, context.images, post_steps,
+            generator=Generator().manual_seed(SEED + scene_idx),
+        )
+        record = {"method": name + SUFFIX_OPTIMIZED, "num_gaussians": tuned.num_gaussians, **scorer(tuned, reconstruction)}
+        del tuned
+        return record
 
     records = [{"method": METHOD_FULL, "num_gaussians": predicted, **scorer(field, reconstruction)}]
+    if post_steps and full_post_optimization:
+        records.append(optimized(METHOD_FULL, field))
 
-    # What the card holds of the prediction, refined and pruned by each
-    # learned model
-    handed, handed_score = field, score
-    if predicted > DEVICE_MAX_GAUSSIANS:
-        top = torch.topk(score, DEVICE_MAX_GAUSSIANS, sorted=False).indices
-        handed, handed_score = field[top], score[top]
-    count = None
-    for name, model, compensate in (
-        (METHOD_LEARNED_COMP, learned_comp, True), (METHOD_LEARNED, learned, False),
-    ):
-        if model is None:
-            continue
-        pruned = refine_and_prune(model, build_rule(compensate), handed, handed_score)
+    # What the card holds of the prediction, cut by the score each mask
+    # reads, refined and pruned by it
+    counts = {}
+    for mask in masks:
+        score = scores[mask.score]
+        handed, handed_score = field, score
+        if predicted > DEVICE_MAX_GAUSSIANS:
+            top = torch.topk(score, DEVICE_MAX_GAUSSIANS, sorted=False).indices
+            handed, handed_score = field[top], score[top]
+        with torch.no_grad():
+            pruned = refine_and_prune(mask.model, build_rule(False), handed, handed_score)
         survivors = pruned.kept
-        if not compensate:
-            count = survivors.num_gaussians
+        counts[mask.label] = survivors.num_gaussians
         records.append({
-            "method": name, "num_gaussians": survivors.num_gaussians,
+            "method": mask.method, "num_gaussians": survivors.num_gaussians,
             "input_gaussians": handed.num_gaussians,
             "soft_keep": pruned.soft["mask"].mean().item(),
             "scale_ratio": (pruned.refined.scales.float().mean() / handed.scales.float().mean()).item(),
             **scorer(survivors, reconstruction),
         })
-        del pruned, survivors
-    del handed
+        if post_steps:
+            records.append(optimized(mask.method, survivors))
+        del pruned, survivors, handed, handed_score
 
     # The threshold, at its own count
-    kept = torch.nonzero(score >= THRESHOLD).squeeze(1)
-    if kept.numel() == 0:
-        kept = score.argmax().reshape(1)
-    thresholded = compensated(field[kept], predicted)
-    records.append({
-        "method": METHOD_THRESHOLD_COMP, "num_gaussians": thresholded.num_gaussians,
-        **scorer(thresholded, reconstruction),
-    })
-    del thresholded
-
-    # The top of the score at the learned mask's count, compensated,
-    # raw and through the refiner trained on such fields
-    if count is not None:
-        matched = compensated(field[torch.topk(score, count, sorted=False).indices], predicted)
+    with torch.no_grad():
+        kept = torch.nonzero(scores["radsplat"] >= THRESHOLD).squeeze(1)
+        if kept.numel() == 0:
+            kept = scores["radsplat"].argmax().reshape(1)
+        thresholded = compensated(field[kept], predicted)
         records.append({
-            "method": METHOD_TOPK_COMP, "num_gaussians": matched.num_gaussians,
-            **scorer(matched, reconstruction),
+            "method": METHOD_THRESHOLD_COMP, "num_gaussians": thresholded.num_gaussians,
+            **scorer(thresholded, reconstruction),
         })
-        if topk_refiner is not None:
-            try:
-                with torch.cuda.amp.autocast(enabled=False):
-                    refined = topk_refiner(matched)
+        del thresholded
+
+    # The top of each score at the primary mask's count, compensated,
+    # raw, refined and optimized; then the raw top of each other mask's
+    # own score at its count
+    with torch.no_grad():
+        for i, mask in enumerate(masks):
+            count = counts[mask.label]
+            for score in (baseline_scores if i == 0 else [mask.score]):
+                at = None if i == 0 else mask.label
+                matched = compensated(field[torch.topk(scores[score], count, sorted=False).indices], predicted)
                 records.append({
-                    "method": METHOD_TOPK_COMP_REFINED, "num_gaussians": refined.num_gaussians,
-                    **scorer(refined, reconstruction),
+                    "method": method_topk(score, at=at), "num_gaussians": matched.num_gaussians,
+                    **scorer(matched, reconstruction),
                 })
-                del refined
-            except RuntimeError as error:
-                if not out_of_memory(error):
-                    raise
-                error.__traceback__ = None
-                torch.cuda.empty_cache()
-                tqdm.write(f"  {count:,} Gaussians did not fit {METHOD_TOPK_COMP_REFINED}, skipped")
-        del matched
-    del field, score
+                if i > 0:
+                    del matched
+                    continue
+                refiner = topk_refiners.get(score)
+                if refiner is not None:
+                    try:
+                        with torch.cuda.amp.autocast(enabled=False):
+                            refined = refiner(matched)
+                        records.append({
+                            "method": method_topk(score, SUFFIX_REFINED), "num_gaussians": refined.num_gaussians,
+                            **scorer(refined, reconstruction),
+                        })
+                        del refined
+                    except RuntimeError as error:
+                        if not out_of_memory(error):
+                            raise
+                        error.__traceback__ = None
+                        torch.cuda.empty_cache()
+                        tqdm.write(f"  {count:,} Gaussians did not fit {method_topk(score, SUFFIX_REFINED)}, skipped")
+                if post_steps:
+                    with torch.enable_grad():
+                        records.append(optimized(method_topk(score), matched))
+                del matched
+    del field, scores
     # Keyed the way the protocol's records are, so that its figure draws
     # these: the one budget is the card's ceiling, and what a cell kept
     # under it is the rule's count
@@ -331,10 +433,7 @@ def table(summary: List[dict], views: int) -> str:
     """One row per method: what it kept, and every metric on both halves."""
     cells = {r["method"]: r for r in summary if r["context_views"] == views}
     rows = []
-    for method in METHODS:
-        r = cells.get(method)
-        if r is None:
-            continue
+    for method, r in cells.items():
         rows.append([
             method, r["num_scenes"], f"{r['num_gaussians']:,.0f}",
             f"{r['num_gaussians'] / r['predicted_gaussians']:.1%}",
@@ -348,7 +447,7 @@ def table(summary: List[dict], views: int) -> str:
     return tabulate(rows, headers=headers, tablefmt="simple", disable_numparse=True)
 
 
-def plot_counts(records: Sequence[dict], context_views: Sequence[int], title: str) -> Figure:
+def plot_counts(records: Sequence[dict], context_views: Sequence[int], title: str, mask_method: str) -> Figure:
     """
     The Gaussians of every test scene, at each view count: what the
     generator predicted, what scores above the threshold, and what the
@@ -364,7 +463,7 @@ def plot_counts(records: Sequence[dict], context_views: Sequence[int], title: st
     )
     width = 0.8 / len(series)
     for axis, views in zip(axes[:, 0], context_views):
-        cells = [r for r in records if r["context_views"] == views and r["method"] == METHOD_LEARNED]
+        cells = [r for r in records if r["context_views"] == views and r["method"] == mask_method]
         cells.sort(key=lambda r: r["scene"])
         positions = range(len(cells))
         for i, (label, color, read) in enumerate(series):
@@ -392,24 +491,49 @@ def plot_counts(records: Sequence[dict], context_views: Sequence[int], title: st
     return figure
 
 
+def parse_mask(spec: str) -> LearnedMask:
+    """label=path[,score[,reference]] on the command line."""
+    label, _, rest = spec.partition("=")
+    parts = rest.split(",")
+    assert label and parts[0], f"A learned mask is given as label=path[,score[,reference]], got {spec!r}"
+    score = parts[1] if len(parts) > 1 else "radsplat"
+    assert score in SCORES, f"The score of {spec!r} has to be one of {list(SCORES)}"
+    reference = float(parts[2]) if len(parts) > 2 else (
+        SPEEDY_IMPORTANCE_REFERENCE if score == "speedy-splat" else IMPORTANCE_REFERENCE
+    )
+    return LearnedMask(label, Path(parts[0]), score, reference)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", default=str(LEARNED_CHECKPOINT), help="the learned mask refiner")
-    parser.add_argument("--compensated-checkpoint", default=None,
-                        help="also score the learned mask refiner trained with compensation of what it keeps")
-    parser.add_argument("--topk-checkpoint", default=str(TOPK_COMPENSATED_CHECKPOINT),
-                        help="the refiner trained on compensated top-k fields")
+    parser.add_argument("--masks", nargs="+", default=[f"Speedy prior={LEARNED_CHECKPOINT},speedy-splat"],
+                        metavar="LABEL=PATH[,SCORE[,REFERENCE]]",
+                        help="the learned mask refiners, each with the score its mask head reads "
+                             f"(one of {list(SCORES)}, radsplat by default) and the reference the score is "
+                             "centred on; the first is the primary one every baseline is count-matched to")
+    parser.add_argument("--baseline-scores", nargs="+", default=["radsplat", "speedy-splat"], choices=list(SCORES),
+                        help="the scores the non-learned top-k baselines are cut by")
+    parser.add_argument("--topk-checkpoints", nargs="*", default=[f"radsplat={TOPK_COMPENSATED_CHECKPOINT}"],
+                        metavar="SCORE=PATH", help="a refiner trained on compensated top-k fields, per score")
+    parser.add_argument("--post-optimize", type=int, default=0, metavar="STEPS",
+                        help="also score every mask and every baseline after this many steps of per-scene "
+                             "3DGS optimization on the context views (anyprune.gaussians.optimization)")
+    parser.add_argument("--full-post-optimize", action="store_true",
+                        help="with --post-optimize, also the whole prediction after as many steps: what the "
+                             "optimization is worth at the full count")
     parser.add_argument("--importance", action="store_true",
                         help="the learned refiners were trained with the importance input")
-    parser.add_argument("--run-name", default=None, help="what to file the results under; the checkpoint's stem by default")
+    parser.add_argument("--run-name", default=None, help="what to file the results under; the primary checkpoint's stem by default")
     parser.add_argument("--num-scenes", type=int, default=None, help="how many test scenes, all by default")
     parser.add_argument("--context-views", type=int, nargs="+", default=EVAL_CONTEXT_VIEWS)
     parser.add_argument("--wandb", choices=("online", "offline", "disabled"), default="online")
     args = parser.parse_args()
 
-    checkpoint = Path(args.checkpoint)
-    assert checkpoint.exists(), f"No learned mask refiner at {checkpoint}"
-    run_name = args.run_name or checkpoint.stem
+    masks = [parse_mask(spec) for spec in args.masks]
+    for mask in masks:
+        assert mask.checkpoint.exists(), f"No learned mask refiner at {mask.checkpoint}"
+    assert len({mask.label for mask in masks}) == len(masks), "Every mask needs its own label"
+    run_name = args.run_name or masks[0].checkpoint.stem
 
     load_dotenv()
     set_rng_seed(SEED, deterministic=False)
@@ -421,50 +545,48 @@ def main():
     if args.num_scenes is not None:
         test_scenes = test_scenes[:args.num_scenes]
 
-    learned = build_refiner(checkpoint, device, mask_head=True, importance=args.importance)
-    learned_comp = topk_refiner = None
-    for name, path, mask_head in (
-        (METHOD_LEARNED_COMP, args.compensated_checkpoint, True),
-        (METHOD_TOPK_COMP_REFINED, args.topk_checkpoint, False),
-    ):
-        if path is None:
-            continue
+    for mask in masks:
+        mask.model = build_refiner(
+            mask.checkpoint, device, mask_head=True, importance=args.importance, reference=mask.reference,
+        )
+    topk_refiners, checkpoints = {}, {mask.method: str(mask.checkpoint) for mask in masks}
+    for spec in args.topk_checkpoints:
+        score, _, path = spec.partition("=")
+        assert score in SCORES and path, f"A top-k refiner is given as score=path, got {spec!r}"
         path = Path(path)
         if not path.exists():
-            print(f"Skipping {name!r}: no checkpoint at {path}")
+            print(f"Skipping {method_topk(score, SUFFIX_REFINED)!r}: no checkpoint at {path}")
             continue
-        refiner = build_refiner(path, device, mask_head=mask_head, importance=args.importance and mask_head)
-        if mask_head:
-            learned_comp = refiner
-        else:
-            topk_refiner = refiner
+        topk_refiners[score] = build_refiner(path, device, mask_head=False, importance=False)
+        checkpoints[method_topk(score, SUFFIX_REFINED)] = str(path)
     reconstructor = build_reconstructor(RECONSTRUCTOR, ANYSPLAT_CHECKPOINT, YONOSPLAT_CHECKPOINT).to(device)
     scorer = Scorer()
 
     output_dir = EVAL_OUTPUT_ROOT / run_name / datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
     window = 2 * max(args.context_views)
-    checkpoints = {
-        METHOD_LEARNED: str(checkpoint),
-        METHOD_LEARNED_COMP: args.compensated_checkpoint if learned_comp is not None else None,
-        METHOD_TOPK_COMP_REFINED: args.topk_checkpoint if topk_refiner is not None else None,
-    }
     print(
-        f"Evaluating the learned mask ({checkpoint}) on {len(test_scenes)} scenes of the DL3DV test "
-        f"split, windows of {window} frames, from {args.context_views} context views. Writing to {output_dir}"
+        f"Evaluating the learned masks {[mask.label for mask in masks]} on {len(test_scenes)} scenes of the "
+        f"DL3DV test split, windows of {window} frames, from {args.context_views} context views, against the "
+        f"{[SCORES[s][0] for s in args.baseline_scores]} top-k at the count of {masks[0].label!r}"
+        + (f", each also after {args.post_optimize} steps of per-scene optimization" if args.post_optimize else "")
+        + f". Writing to {output_dir}"
     )
     use_wandb = args.wandb != "disabled"
     if use_wandb:
         wandb.init(
             project=WANDB_PROJECT, mode=args.wandb, name=f"{run_name}-eval", job_type="eval",
             config={"checkpoints": checkpoints, "num_scenes": len(test_scenes),
-                    "context_views": args.context_views, "importance_input": args.importance},
+                    "context_views": args.context_views, "importance_input": args.importance,
+                    "baseline_scores": args.baseline_scores, "post_optimize": args.post_optimize},
             settings=wandb.Settings(x_disable_stats=True),
         )
 
     def write_results():
         (output_dir / "results.json").write_text(json.dumps({
             "checkpoints": checkpoints, "importance_input": args.importance,
+            "masks": [{"label": m.label, "score": m.score, "reference": m.reference} for m in masks],
+            "baseline_scores": args.baseline_scores, "post_optimize": args.post_optimize,
             "scenes": [Path(dataset.scenes[idx]).name for idx in test_scenes],
             "records": records, "summary": summarize(records),
         }, indent=2))
@@ -485,8 +607,9 @@ def main():
             }
             try:
                 measured = evaluate_scene(
-                    learned, learned_comp, topk_refiner, scorer, reconstructor, scene,
-                    context_idx[:views], test_idx[:views],
+                    masks, args.baseline_scores, topk_refiners, args.post_optimize, scorer, reconstructor,
+                    scene, context_idx[:views], test_idx[:views], scene_idx,
+                    full_post_optimization=args.full_post_optimize,
                 )
             except RuntimeError as error:
                 if not out_of_memory(error):
@@ -507,14 +630,18 @@ def main():
 
     summary = summarize(records)
     assert summary, "No scene was measured: nothing to report"
-    report = [f"Learned mask ({checkpoint}), {len(test_scenes)} DL3DV test scenes; the top-k controls at its count"]
+    report = [
+        f"Learned masks {[mask.label for mask in masks]}, {len(test_scenes)} DL3DV test scenes; "
+        f"the baselines at the count of {masks[0].label!r}"
+    ]
     for views in args.context_views:
         report += [f"\n{views} context views\n", table(summary, views)]
     report = "\n".join(report)
     print(report)
     (output_dir / "summary.txt").write_text(report)
 
-    drawn = [style for style in STYLES if any(r["method"] == style[0] for r in summary)]
+    methods = list(dict.fromkeys(r["method"] for r in summary))
+    drawn = [style_of(method, masks) for method in methods]
     figure = plot_eval_histogram(
         summary, [RECONSTRUCTOR], args.context_views, [DEVICE_MAX_GAUSSIANS], drawn,
         title=f"DL3DV test split, {len(test_scenes)} scenes, at the count the learned mask kept",
@@ -526,6 +653,7 @@ def main():
     figure = plot_counts(
         records, args.context_views,
         title=f"Gaussians per test scene: predicted, above the threshold, kept by the learned mask",
+        mask_method=masks[0].method,
     )
     counts_path = output_dir / "gaussian_counts.png"
     figure.savefig(counts_path, dpi=150, bbox_inches="tight")

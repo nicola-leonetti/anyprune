@@ -40,7 +40,9 @@ from tqdm import tqdm
 
 from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import psnr
-from anyprune.gaussians import Gaussians, Pruner, blending_weights, radsplat_score
+from anyprune.gaussians import (
+    Gaussians, Pruner, blending_weights, radsplat_score, sensitivity_scores,
+)
 from anyprune.models import RECONSTRUCTORS, SplatFormer, build_reconstructor
 from anyprune.models.utils import (
     build_splatformer_optimizer, build_splatformer_scheduler,
@@ -104,6 +106,15 @@ def thin(
     what it carried in the whole field rather than in what was left of
     it.
     """
+    if with_score and cfg.pruning.learned.score != "radsplat":
+        # A learned rule reading another score than the one the pruner
+        # ranks by: the field is cut by that same score when it has to
+        # be, so that what the rule reads is what chose its input
+        score = learned_score(cfg, gaussians, scored)
+        if gaussians.num_gaussians <= kept:
+            return gaussians, score
+        index = torch.argsort(score, descending=True)[:kept]
+        return gaussians[index], score[index]
     measured = None
     if pruner.measured or with_score:
         measured = blending_weights(
@@ -119,6 +130,30 @@ def thin(
         generator=generator, measured=measured,
     )[:kept]
     return gaussians[index], None if score is None else score[index]
+
+
+def learned_score(cfg, gaussians: Gaussians, scored: ViewSet) -> Tensor:
+    """
+    The score a learned rule reads (pruning.learned.score), measured
+    over the views 'scored': the RadSplat peak blending weight, or
+    Speedy-Splat's sensitivity (anyprune.gaussians.sensitivity), which
+    costs about twice the sweep.
+    """
+    which = cfg.pruning.learned.score
+    assert which in ("radsplat", "speedy-splat"), (
+        f"pruning.learned.score has to be 'radsplat' or 'speedy-splat', got {which!r}"
+    )
+    if which == "radsplat":
+        return radsplat_score(blending_weights(
+            gaussians, scored.poses, scored.intrinsics, scored.image_shape,
+            batches_per_pass=cfg.pruning.batches_per_pass,
+            max_intersections=cfg.device_max_intersections,
+        ))
+    return sensitivity_scores(
+        gaussians, scored.poses, scored.intrinsics, scored.image_shape, fisher=False,
+        batches_per_pass=cfg.pruning.batches_per_pass,
+        max_intersections=cfg.device_max_intersections,
+    ).speedy
 
 
 def supervision_views(cfg, reconstruction, generator: Generator) -> Tuple[ViewSet, Dict[str, slice]]:
@@ -820,22 +855,26 @@ def validate(
         views = reconstruction.test
         try:
             scored = scoring_views(cfg, reconstruction.context)
-            measured = None
-            if pruner.measured or with_score:
-                measured = blending_weights(
+            if with_score and cfg.pruning.learned.score != "radsplat":
+                score = learned_score(cfg, reconstruction.gaussians, scored)
+                order = torch.argsort(score, descending=True)
+            else:
+                measured = None
+                if pruner.measured or with_score:
+                    measured = blending_weights(
+                        reconstruction.gaussians,
+                        scored.poses, scored.intrinsics, scored.image_shape,
+                        batches_per_pass=cfg.pruning.batches_per_pass,
+                        max_intersections=cfg.device_max_intersections,
+                    )
+                order = pruner.order(
                     reconstruction.gaussians,
                     scored.poses, scored.intrinsics, scored.image_shape,
-                    batches_per_pass=cfg.pruning.batches_per_pass,
-                    max_intersections=cfg.device_max_intersections,
+                    generator=Generator().manual_seed(cfg.split_seed + scene_idx),
+                    measured=measured,
                 )
-            order = pruner.order(
-                reconstruction.gaussians,
-                scored.poses, scored.intrinsics, scored.image_shape,
-                generator=Generator().manual_seed(cfg.split_seed + scene_idx),
-                measured=measured,
-            )
-            score = radsplat_score(measured) if with_score else None
-            del measured
+                score = radsplat_score(measured) if with_score else None
+                del measured
         except RuntimeError as error:
             if not out_of_memory(error):
                 raise

@@ -10,3 +10,10 @@
 [submodule "anyprune/datasets/external/splatformer_data_generator"]
 	path = anyprune/datasets/external/splatformer_data_generator
 	url = https://github.com/ChenYutongTHU/SplatFormer_DataGenerator.git
+[submodule "anyprune/gaussians/external/PUP-3DGS"]
+	path = anyprune/gaussians/external/PUP-3DGS
+	url = https://github.com/j-alex-hanson/gaussian-splatting-pup.git
+[submodule "anyprune/gaussians/external/Speedy-Splat"]
+	path = anyprune/gaussians/external/Speedy-Splat
+	url = https://github.com/j-alex-hanson/speedy-splat.git
+	branch = speedy-splat

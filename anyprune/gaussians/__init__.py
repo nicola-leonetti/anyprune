@@ -8,6 +8,8 @@ from .importance import (
     importance_score, mini_splatting_score, radsplat_score, score_of,
 )
 from .pruning import SELECTIONS, Pruner
+from .optimization import fine_tune, scene_extent
+from .sensitivity import Sensitivities, pup_score, sensitivity_scores, speedy_splat_score
 
 __all__ = [
     "BlendingWeights",
@@ -16,12 +18,18 @@ __all__ = [
     "Pruner",
     "SCORES",
     "SELECTIONS",
+    "Sensitivities",
     "TILE_SIZE",
     "blending_weights",
     "depth_runs",
     "importance_score",
     "mini_splatting_score",
+    "pup_score",
     "radsplat_score",
+    "fine_tune",
+    "scene_extent",
+    "sensitivity_scores",
+    "speedy_splat_score",
     "score_of",
     "view_matrices",
 ]
