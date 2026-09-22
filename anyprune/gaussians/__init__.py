@@ -8,7 +8,7 @@ from .importance import (
     importance_score, mini_splatting_score, radsplat_score, score_of,
 )
 from .pruning import SELECTIONS, Pruner
-from .optimization import fine_tune, scene_extent
+from .optimization import fine_tune, fine_tune_stages, scene_extent
 from .sensitivity import Sensitivities, pup_score, sensitivity_scores, speedy_splat_score
 
 __all__ = [
@@ -27,6 +27,7 @@ __all__ = [
     "pup_score",
     "radsplat_score",
     "fine_tune",
+    "fine_tune_stages",
     "scene_extent",
     "sensitivity_scores",
     "speedy_splat_score",

@@ -41,7 +41,8 @@ from tqdm import tqdm
 from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import psnr
 from anyprune.gaussians import (
-    Gaussians, Pruner, blending_weights, radsplat_score, sensitivity_scores,
+    Gaussians, Pruner, blending_weights, fine_tune, radsplat_score, scene_extent,
+    sensitivity_scores,
 )
 from anyprune.models import RECONSTRUCTORS, SplatFormer, build_reconstructor
 from anyprune.models.utils import (
@@ -154,6 +155,82 @@ def learned_score(cfg, gaussians: Gaussians, scored: ViewSet) -> Tensor:
         batches_per_pass=cfg.pruning.batches_per_pass,
         max_intersections=cfg.device_max_intersections,
     ).speedy
+
+
+def distillation_target(
+    cfg, splatformer, rule: LearnedRule, gaussians: Gaussians, score: Optional[Tensor],
+    context: ViewSet, generator: Generator,
+) -> Optional[Tuple[Tensor, Gaussians, float]]:
+    """
+    What per-scene optimization would make of the field the refiner was
+    handed (optim.distillation): the mask is read off a forward with no
+    gradient, the *reconstructor's* Gaussians are cut to what it keeps,
+    and those are optimized for distillation.steps steps on the context
+    views, the way the benchmark post-optimizes a pruned field. Comes
+    back as the (N,) keep mask, the optimized survivors, and the
+    scene's extent the means are measured against; None when the rule
+    keeps nothing.
+
+    The target is the optimization of the *input*, not of the refiner's
+    own output: chasing the optimization of its own prediction is a
+    moving target, and the run of 2026-09-22 drifted off it (opacity
+    and scale x126, 16 dB refined against 26 for the same recipe
+    without the term).
+    """
+    with torch.no_grad():
+        refined, logits = refine(cfg, splatformer, gaussians, score)
+        pruned = apply_rule(rule, refined, logits, noisy=False)
+        keep = pruned.hard
+        if int(keep.sum().item()) == 0:
+            return None
+        survivors = gaussians[keep]
+        survivors = replace(survivors, **{
+            name: getattr(survivors, name).float()
+            for name in ("means", "covariances", "harmonics", "opacities", "scales", "rotations")
+        })
+        del refined, logits, pruned
+    seed = int(torch.randint(2 ** 31, (1,), generator=generator).item())
+    optimized = fine_tune(
+        survivors, context.poses, context.intrinsics, context.images,
+        cfg.optim.distillation.steps, generator=Generator().manual_seed(seed), factorize=False,
+    )
+    return keep, optimized, scene_extent(survivors, context.poses)
+
+
+def distillation_loss(
+    cfg, refined: Gaussians, target: Tuple[Tensor, Gaussians, float]
+) -> Tuple[Tensor, Dict[str, float]]:
+    """
+    How far the refiner's output sits from where optimization would
+    have taken it, per surviving Gaussian: the mean L1 of the means (per
+    unit of scene extent), of the log scales, of the opacity logits and
+    of the harmonics, and one minus the cosine between the rotations,
+    each at the weight optim.distillation gives it, times the whole
+    term's weight. The target does not carry gradient.
+    """
+    keep, optimized, extent = target
+    weights = cfg.optim.distillation
+    means = (refined.means[keep].float() - optimized.means).abs().mean() / extent
+    scales = (refined.scales[keep].float().clamp_min(1e-8).log() - optimized.scales.log()).abs().mean()
+    q = torch.nn.functional.normalize(refined.rotations[keep].float(), dim=-1)
+    rotations = (1.0 - (q * optimized.rotations).sum(dim=-1).abs()).mean()
+    opacities = (
+        torch.logit(refined.opacities[keep].float().clamp(1e-4, 1 - 1e-4))
+        - torch.logit(optimized.opacities.clamp(1e-4, 1 - 1e-4))
+    ).abs().mean()
+    harmonics = (refined.harmonics[keep].float() - optimized.harmonics).abs().mean()
+    terms = {
+        "distill_means": means, "distill_scales": scales, "distill_rotations": rotations,
+        "distill_opacities": opacities, "distill_harmonics": harmonics,
+    }
+    loss = weights.weight * (
+        weights.means * means + weights.scales * scales + weights.rotations * rotations
+        + weights.opacities * opacities + weights.harmonics * harmonics
+    )
+    logged = {name: value.item() for name, value in terms.items()}
+    logged["distillation"] = loss.item()
+    return loss, logged
+
 
 
 def supervision_views(cfg, reconstruction, generator: Generator) -> Tuple[ViewSet, Dict[str, slice]]:
@@ -363,6 +440,14 @@ def training_step(
         reconstruction.gaussians.num_gaussians
     )
 
+    # The distillation target first, off its own forward, so that its
+    # optimization does not sit on top of the refiner's graph
+    target = None
+    if cfg.optim.distillation.steps > 0:
+        target = distillation_target(
+            cfg, splatformer, rule, reconstruction.gaussians, score, reconstruction.context, generator,
+        )
+
     refined, logits = refine(cfg, splatformer, reconstruction.gaussians, score)
     if stages == 1:
         pruned = apply_rule(rule, refined, logits, noisy=True)
@@ -382,6 +467,10 @@ def training_step(
         sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
         loss = loss + sparsity
         terms.update(sparsity_terms)
+        if target is not None:
+            distill, distill_terms = distillation_loss(cfg, refined, target)
+            loss = loss + distill
+            terms.update(distill_terms)
         # The terms and the number that goes into the log are the ones
         # the criterion came back with, which are what a run that does
         # not normalize logs too and are the only ones comparable
@@ -431,12 +520,21 @@ def training_step(
         terms.update(sparsity_terms)
         rendered = torch.cat(rendered_stages, dim=0)
         del rendered_stages
+        # The distillation term reads the refined field itself, so it
+        # goes into the one backward through the refiner's graph
+        extra_outputs, extra_grads = [], []
+        if target is not None:
+            distill, distill_terms = distillation_loss(cfg, refined, target)
+            extra_outputs.append(scaler.scale(distill / loss_scale))
+            extra_grads.append(torch.ones_like(extra_outputs[-1]))
+            reported += distill.item()
+            terms.update(distill_terms)
         # The refiner's graph, once, from what the stages accumulated
         torch.autograd.backward(
             [getattr(refined, name) for name in RENDER_FIELDS]
-            + ([] if logits is None else [logits]),
+            + ([] if logits is None else [logits]) + extra_outputs,
             [leaves[name].grad for name in RENDER_FIELDS]
-            + ([] if logits is None else [logits_leaf.grad]),
+            + ([] if logits is None else [logits_leaf.grad]) + extra_grads,
         )
     if cfg.optim.grad_clip_norm > 0:
         scaler.unscale_(optimizer)

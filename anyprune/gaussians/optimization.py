@@ -20,7 +20,7 @@ from (or through) is optimized as the same thing it is rasterized as.
 """
 import math
 from dataclasses import replace
-from typing import Optional, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 import gsplat
 import torch
@@ -110,6 +110,7 @@ def fine_tune(
     generator: Optional[Generator] = None,
     near_plane: float = 0.01,
     far_plane: float = 1e10,
+    factorize: bool = True,
 ) -> Gaussians:
     """
     The field after 'steps' steps of 3DGS optimization against the V
@@ -121,6 +122,38 @@ def fine_tune(
     assert steps >= 0, f"Cannot optimize for {steps} steps"
     if steps == 0:
         return gaussians
+    for _, field in fine_tune_stages(
+        gaussians, poses, intrinsics, images, [steps], generator, near_plane, far_plane, factorize,
+    ):
+        return field
+
+
+def fine_tune_stages(
+    gaussians: Gaussians,
+    poses: Tensor,
+    intrinsics: Tensor,
+    images: Tensor,
+    stages: Sequence[int],
+    generator: Optional[Generator] = None,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    factorize: bool = True,
+) -> Iterator[Tuple[int, Gaussians]]:
+    """
+    fine_tune() handing the field out along the way: one (step, field)
+    after each of the 'stages' (ascending step counts), the schedule
+    being that of the last one, so that one optimization answers for
+    every length up to it.
+
+    With 'factorize' off the scales and rotations (xyzw) the field
+    carries are optimized as they are, rather than the ones its
+    covariances factorize into, so that what comes back is written in
+    the same parameters as what went in: what a loss between the two
+    needs.
+    """
+    stages = sorted(set(int(stage) for stage in stages))
+    assert stages and stages[0] > 0, f"The stages have to be positive step counts, got {stages}"
+    steps = stages[-1]
     device = gaussians.device
     poses = poses.reshape(-1, 4, 4).to(gaussians.means)
     intrinsics = intrinsics.reshape(-1, 3, 3).to(gaussians.means)
@@ -129,7 +162,11 @@ def fine_tune(
     sh_degree = gaussians.sh_degree
 
     with torch.no_grad():
-        scales, rotations = _factorize(gaussians.covariances.float())
+        if factorize:
+            scales, rotations = _factorize(gaussians.covariances.float())
+        else:
+            scales = gaussians.scales.float().clamp_min(1e-8)
+            rotations = F.normalize(gaussians.rotations.float(), dim=-1)[:, [3, 0, 1, 2]]
         opacities = gaussians.opacities.float().clamp(1e-4, 1 - 1e-4)
         parameters = {
             "means": gaussians.means.float().clone(),
@@ -174,23 +211,28 @@ def fine_tune(
         for group in optimizer.param_groups:
             if group["name"] == "means":
                 group["lr"] *= decay
-
-    with torch.no_grad():
-        scales = parameters["log_scales"].exp()
-        rotation = _quaternion_to_matrix(parameters["rotations"])
-        scaled = rotation * scales.unsqueeze(-2)
-        covariances = scaled @ scaled.transpose(-1, -2)
-        harmonics = torch.cat([parameters["harmonics_dc"], parameters["harmonics_rest"]], dim=1).transpose(-2, -1)
-        wxyz = F.normalize(parameters["rotations"], dim=-1)
-        return replace(
-            gaussians,
-            means=parameters["means"].detach().to(gaussians.means.dtype),
-            covariances=covariances.to(gaussians.covariances.dtype),
-            harmonics=harmonics.contiguous().to(gaussians.harmonics.dtype),
-            opacities=torch.sigmoid(parameters["opacity_logits"]).detach().to(gaussians.opacities.dtype),
-            scales=scales.to(gaussians.scales.dtype),
-            rotations=wxyz[:, [1, 2, 3, 0]].to(gaussians.rotations.dtype),
-        )
+        if step + 1 in stages:
+            yield step + 1, assemble(gaussians, parameters)
 
 
-__all__ = ["fine_tune", "scene_extent"]
+@torch.no_grad()
+def assemble(gaussians: Gaussians, parameters: Dict[str, Tensor]) -> Gaussians:
+    """The field the optimized parameters make, in the dtypes of the one they came from."""
+    scales = parameters["log_scales"].exp()
+    rotation = _quaternion_to_matrix(parameters["rotations"])
+    scaled = rotation * scales.unsqueeze(-2)
+    covariances = scaled @ scaled.transpose(-1, -2)
+    harmonics = torch.cat([parameters["harmonics_dc"], parameters["harmonics_rest"]], dim=1).transpose(-2, -1)
+    wxyz = F.normalize(parameters["rotations"], dim=-1)
+    return replace(
+        gaussians,
+        means=parameters["means"].detach().to(gaussians.means.dtype),
+        covariances=covariances.to(gaussians.covariances.dtype),
+        harmonics=harmonics.contiguous().to(gaussians.harmonics.dtype),
+        opacities=torch.sigmoid(parameters["opacity_logits"]).detach().to(gaussians.opacities.dtype),
+        scales=scales.to(gaussians.scales.dtype),
+        rotations=wxyz[:, [1, 2, 3, 0]].to(gaussians.rotations.dtype),
+    )
+
+
+__all__ = ["fine_tune", "fine_tune_stages", "scene_extent"]

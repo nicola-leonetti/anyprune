@@ -208,6 +208,29 @@ optim:
   mask_loss_weight: 0.01
   enable_amp: true
 
+  # Distillation of per-scene optimization (2026-09-22): each step the
+  # mask is read off a forward without gradient, the reconstructor's
+  # field is cut to what it keeps and optimized for 'steps' steps on
+  # the context views the way the benchmark post-optimizes a pruned
+  # field (anyprune.gaussians.optimization), and the refiner is
+  # charged, per surviving Gaussian, for how far its output sits from
+  # where the optimization took that input: L1 of the means per unit of
+  # scene extent, of the log scales, of the opacity logits and of the
+  # harmonics, and one minus the cosine of the rotations, at these
+  # weights, on top of the photometric loss. steps 0 turns it off; 100
+  # steps cost 3-12 s a step on 100k-800k Gaussians, 50 about half
+  # that. The weight is what the first run got wrong: at 1.0 the term
+  # was ten times the photometric loss and the refiner drifted off (see
+  # distillation_target).
+  distillation:
+    steps: 0
+    weight: 0.1
+    means: 1.0
+    scales: 1.0
+    rotations: 1.0
+    opacities: 0.1
+    harmonics: 1.0
+
   # A step's loss is divided by what a field of its size has been
   # costing the run, over the mean over every step, so that the budgets
   # pull on the weights equally hard instead of the sparse ones pulling
