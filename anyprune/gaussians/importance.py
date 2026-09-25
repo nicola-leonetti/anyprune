@@ -2,8 +2,9 @@
 The per-Gaussian importance scores the pruning literature defines,
 measured on a field one of this project's reconstructors has predicted.
 
-Both scores implemented here are built out of the same quantity, the
-blending weight a Gaussian carries on a ray:
+The scores implemented here are built out of the same walk over the
+rays, and two of them out of the blending weight a Gaussian carries on
+a ray:
 
     w_ij = alpha_ij * T_ij,    T_ij = prod_{k < i} (1 - alpha_kj)
 
@@ -44,13 +45,33 @@ implementation applies it to (2) as well, by zeroing every Gaussian
 that is never the largest weight on any ray, which is what this module
 does too.
 
-Both scores are measured over the views the reconstructor was given,
+LightGaussian (Fan et al., NeurIPS 2024, arXiv:2311.17245, anyprune/
+gaussians/external/LightGaussian) does not weigh a ray at all: its
+global significance counts the rays a Gaussian was composited on, times
+its opacity, times a power of its volume,
+
+    GS_j = sum_{i=1..MHW} 1(G(X_j), r_i) * sigma_j * gamma(Sigma_j)     (4)
+    gamma(Sigma_j) = (V_j / V_90)^beta,    V_j = prod(s_j),  beta = 0.1
+
+with V_90 the volume 90% of the field is larger than, and prunes the
+lowest 66% of it once before fine-tuning. The count is taken the way
+the rasterizer it pins counts it (renderCUDA_count in
+compress-diff-gaussian-rasterization, at the pinned commit, which adds
+the opacity without the transmittance): a hit is every pixel the
+Gaussian was blended into, past the 1/255 alpha cut and in front of
+where the pixel went opaque, which is what every intersection a sweep
+yields is. The volume term is LightGaussian's own code
+(calculate_v_imp_score in its prune.py), imported from the submodule.
+
+All the scores are measured over the views the reconstructor was given,
 which are this setting's training views: the held-out views are what
 the pruned field is scored on, and a score that had read them would be
 answering a question it had already seen.
 """
+import functools
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Iterator, Optional, Tuple
 
 import gsplat
@@ -63,7 +84,7 @@ from .gaussians import Gaussians, depth_runs, view_matrices
 
 # The names a caller can ask for a score by, and the ones that need the
 # field rendered before they can answer.
-SCORES = ("uniform", "radsplat", "mini-splatting", "mini-splatting-outdoor")
+SCORES = ("uniform", "radsplat", "mini-splatting", "mini-splatting-outdoor", "lightgaussian")
 MEASURED_SCORES = tuple(name for name in SCORES if name != "uniform")
 
 # Where the rasterizer holds an alpha, copied from gsplat's kernels so
@@ -84,12 +105,16 @@ _BATCHES_PER_PASS = 32
 # rasterizer has already blown up to its minimum footprint.
 _MIN_PROJECTED_AREA = 1e-6
 
+# The power LightGaussian raises its volume ratio to, beta of (4) and
+# --v_pow of its scripts/run_prune_finetune.sh
+LIGHTGAUSSIAN_V_POW = 0.1
+
 
 @dataclass
 class BlendingWeights:
     """
     What one sweep over a set of views measured of every Gaussian in a
-    field, as the four numbers the scores above are written out of.
+    field, as the five numbers the scores above are written out of.
 
     Every array is one entry per Gaussian, in the order the field holds
     them.
@@ -98,6 +123,7 @@ class BlendingWeights:
     total: Tensor   # (N,) the sum of the weights it carried
     density: Tensor # (N,) sum over views of its weight over its area
     peaked: Tensor  # (N,) bool, whether it was ever a ray's largest
+    hits: Tensor    # (N,) int64, how many rays it was composited on
 
     @property
     def num_gaussians(self) -> int:
@@ -358,7 +384,7 @@ def blending_weights(
     """
     Render the field from every one of V views and gather what each
     Gaussian contributed to it, without keeping any of the renders: a
-    sweep() reduced to the four numbers the scores above are written
+    sweep() reduced to the five numbers the scores above are written
     out of. A Gaussian the renders never showed scores zero here.
     """
     device = gaussians.device
@@ -369,6 +395,7 @@ def blending_weights(
         total=torch.zeros(num_gaussians, device=device),
         density=torch.zeros(num_gaussians, device=device),
         peaked=torch.zeros(num_gaussians, dtype=torch.bool, device=device),
+        hits=torch.zeros(num_gaussians, dtype=torch.int64, device=device),
     )
 
     current = None
@@ -403,6 +430,7 @@ def blending_weights(
             # (weight, index) is the index of its maximum weight.
             ray_peak = torch.zeros(height * width, dtype=torch.int64, device=device)
         view_total.index_add_(0, it.gaussian_ids, it.weights)
+        measured.hits.index_add_(0, it.gaussian_ids, torch.ones_like(it.gaussian_ids))
         measured.peak.scatter_reduce_(0, it.gaussian_ids, it.weights, reduce="amax")
         ray_peak.scatter_reduce_(
             0, it.rays,
@@ -439,15 +467,60 @@ def mini_splatting_score(
     return torch.where(measured.peaked, score, 0.0)
 
 
-def score_of(score: str, measured: BlendingWeights) -> Tensor:
+@functools.cache
+def _lightgaussian_v_imp_score():
+    """
+    calculate_v_imp_score out of LightGaussian's prune.py. The module
+    imports its renderer and its scene loader, whose CUDA extensions
+    are stood in for since nothing here calls them.
+    """
+    from ..models._external import owns, stub_unbuilt_extensions
+
+    stub_unbuilt_extensions(
+        "diff_gaussian_rasterization", "simple_knn", "simple_knn._C", "icecream"
+    )
+    with owns("LightGaussian"):
+        from prune import calculate_v_imp_score
+    return calculate_v_imp_score
+
+
+def lightgaussian_score(
+    measured: BlendingWeights,
+    gaussians: Gaussians,
+    v_pow: float = LIGHTGAUSSIAN_V_POW,
+) -> Tensor:
+    """
+    LightGaussian's global significance, equation (4): what its
+    rasterizer accumulates, the opacity once per ray the Gaussian was
+    composited on, through its own volume weighting. That reads the
+    field's scales, which the sweep does not keep.
+    """
+    assert measured.num_gaussians == gaussians.num_gaussians, (
+        f"The measurement is of {measured.num_gaussians:,} Gaussians "
+        f"and the field holds {gaussians.num_gaussians:,}"
+    )
+    # The opacity as the sweep read it, and so as the rasterizer blends it
+    significance = gaussians.opacities.float().clamp(0.0, 1.0) * measured.hits
+    # calculate_v_imp_score only reads get_scaling, the activated scales
+    field = SimpleNamespace(get_scaling=gaussians.scales.float())
+    return _lightgaussian_v_imp_score()(field, significance, v_pow)
+
+
+def score_of(
+    score: str, measured: BlendingWeights, gaussians: Optional[Gaussians] = None
+) -> Tensor:
     """
     One of the scores above, by name, read off a sweep that has already
-    been made: every score is written out of the same four numbers, so a
-    field measured once answers for all of them.
+    been made: every score is written out of the same five numbers, so a
+    field measured once answers for all of them. LightGaussian's also
+    reads the field that was measured, which is 'gaussians'.
     """
     assert score in MEASURED_SCORES, (
         f"The score has to be one of {MEASURED_SCORES}: {score} is not"
     )
+    if score == "lightgaussian":
+        assert gaussians is not None, "LightGaussian's score reads the field's scales, pass 'gaussians'"
+        return lightgaussian_score(measured, gaussians)
     if score == "radsplat":
         return radsplat_score(measured)
     return mini_splatting_score(
@@ -471,7 +544,8 @@ def importance_score(
     Gaussian matters more to the views it was measured over.
     """
     return score_of(
-        score, blending_weights(gaussians, poses, intrinsics, image_shape, **kwargs)
+        score, blending_weights(gaussians, poses, intrinsics, image_shape, **kwargs),
+        gaussians,
     )
 
 
@@ -480,8 +554,10 @@ __all__ = [
     "MEASURED_SCORES",
     "Pass",
     "SCORES",
+    "LIGHTGAUSSIAN_V_POW",
     "blending_weights",
     "importance_score",
+    "lightgaussian_score",
     "mini_splatting_score",
     "radsplat_score",
     "score_of",

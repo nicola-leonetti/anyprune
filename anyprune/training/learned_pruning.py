@@ -115,6 +115,7 @@ with.
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
+import math
 import torch
 from torch import Tensor
 
@@ -147,6 +148,24 @@ class LearnedRule:
     degradation_reference: str = "input"
     degradation_against_truth: bool = False
     degradation_power: float = 2.0
+    lossless_enabled: bool = False
+    lossless_quality: str = "deviation"
+    lossless_tolerance_db: float = 0.1
+    lossless_tolerance_reference: str = "truth"
+    lossless_quality_floor_db: float = 40.0
+    lossless_quality_scale: float = 8.0
+    lossless_hinge: bool = True
+    lossless_hinge_softness_db: float = 0.1
+    rate_controller: bool = False
+    rate_controller_step: float = 0.002
+    rate_controller_max_step: float = 0.005
+    rate_weight_initial: float = 0.005
+    rate_weight_minimum: float = -0.05
+    rate_weight_maximum: float = 0.05
+    rate_reference_gaussians: float = 100_352.0
+    rate_size_exponent: float = 0.0
+    rate_controller_shared: bool = False
+    lossless_reference: str = "input"
     compensate: bool = False
     compensation_exponent: float = 1.0
 
@@ -176,6 +195,22 @@ class LearnedRule:
         assert self.degradation_reference in ("input", "refined"), (
             f"The degradation reference is 'input' or 'refined', got {self.degradation_reference!r}"
         )
+        assert self.lossless_reference in ("input", "refined"), (
+            "The lossless objective is measured against the field the refiner was handed "
+            f"('input') or against the refined field left whole ('refined'), got {self.lossless_reference!r}"
+        )
+        assert self.lossless_quality in ("deviation", "drop"), (
+            "The lossless objective charges the 'deviation' from the reference render or "
+            f"the PSNR 'drop' against the truth, got {self.lossless_quality!r}"
+        )
+        assert self.lossless_tolerance_reference in ("truth", "fixed"), (
+            "The tolerance of the lossless objective is read against 'truth' or at a "
+            f"'fixed' floor, got {self.lossless_tolerance_reference!r}"
+        )
+        assert self.lossless_tolerance_db >= 0.0 and self.lossless_quality_scale > 0.0, (
+            f"Need a non-negative tolerance and a positive scale, got "
+            f"{self.lossless_tolerance_db} and {self.lossless_quality_scale}"
+        )
 
     @property
     def by_opacity(self) -> bool:
@@ -185,6 +220,11 @@ class LearnedRule:
     def enabled(self) -> bool:
         """Whether anything of a refined field is dropped at all."""
         return self.mask or self.by_opacity
+
+    @property
+    def by_lossless(self) -> bool:
+        """Whether the rate is traded against a quality budget rather than weighed."""
+        return self.lossless_enabled
 
     @property
     def by_degradation(self) -> bool:
@@ -396,6 +436,190 @@ def degradation_loss(
     return rule.degradation_weight * damage.pow(rule.degradation_power).mean()
 
 
+def lossless_loss(
+    rule: LearnedRule, rendered: Tensor, reference: Tensor, keep: Tensor,
+    truth: Optional[Tensor] = None,
+) -> Tuple[Tensor, Dict[str, float]]:
+    """
+    The rate against a quality budget rather than weighed against it:
+    the larger of what the cut costs and what it keeps, so that the
+    mask is only ever pushed down while the render it makes stays
+    within 'lossless_tolerance_db' of the reference render (detached;
+    the field the refiner was handed).
+
+        quality = scale * relu(excess in dB)
+        rate    = mean keep
+        loss    = max(quality, rate)
+
+    Inside the budget the quality term is zero, so the loss is the rate
+    and the only gradient pushes the mask down; outside it the quality
+    term climbs past the rate and the only gradient pushes the render
+    back. The equilibrium sits where the two cross, a rate/scale of a
+    dB outside the budget, so the scale is how hard the constraint is
+    held (10 leaves a twentieth of a dB at a half-kept field).
+
+    Both terms are written in dB because the errors themselves are not
+    comparable to a share: an error a hundred times the budget is a
+    loss of a hundred against a rate below one, and the step is then
+    whatever the gradient clipping leaves of it, the same for every
+    violation. In dB the term is a few units at a few dB out.
+
+    'lossless_quality' says what the excess is measured on:
+
+      - 'deviation' (no truth in the gradient): the mean squared
+        difference from the reference render against a budget, which is
+        either the share of the reference's own error against the truth
+        that costs tolerance_db of PSNR - (10^(tol/10) - 1) times it,
+        the error a render may add to drop the reference's PSNR by the
+        tolerance when the two are uncorrelated, the truth read as a
+        scale only and never differentiated - or, with
+        'lossless_tolerance_reference' at 'fixed', the error of a
+        render lossless_quality_floor_db from the reference, which
+        needs no truth at all. Note that this charges the refiner for
+        *improving* on its input as much as for damaging it: every
+        deviation eats the budget.
+      - 'drop' (the truth in the gradient): the PSNR the render loses
+        against the truth compared to the reference, less the
+        tolerance, so that a render better than the reference is free
+        and only damage is charged.
+    """
+    reference = reference.detach()
+    assert rendered.shape == reference.shape, (
+        f"Rendered {tuple(rendered.shape)} against a reference of {tuple(reference.shape)}"
+    )
+    floor = torch.finfo(torch.float32).tiny
+    if rule.lossless_quality == "drop":
+        assert truth is not None, "The PSNR drop is read against the truth"
+        ours = (rendered - truth).pow(2).mean()
+        theirs = (reference - truth).pow(2).mean().detach()
+        excess = 10.0 * torch.log10(ours.clamp_min(floor) / theirs.clamp_min(floor)) - rule.lossless_tolerance_db
+        measured = {"lossless_drop_db": excess.item() + rule.lossless_tolerance_db}
+    else:
+        error = (rendered - reference).pow(2).mean()
+        if rule.lossless_tolerance_reference == "truth":
+            assert truth is not None, "The budget against the truth needs the truth"
+            budget = (reference - truth).pow(2).mean().detach() * (
+                10.0 ** (rule.lossless_tolerance_db / 10.0) - 1.0
+            )
+        else:
+            budget = torch.full_like(error, 10.0 ** (-rule.lossless_quality_floor_db / 10.0))
+        excess = 10.0 * torch.log10(error.clamp_min(floor) / budget.clamp_min(floor))
+        measured = {
+            "lossless_psnr_vs_reference": -10.0 * math.log10(max(error.item(), 1e-20)),
+            "lossless_budget_used_db": excess.item(),
+        }
+    if not rule.lossless_hinge:
+        quality = excess
+    elif rule.lossless_hinge_softness_db > 0.0:
+        # Softened, so that the quality term starts pushing back just
+        # before the boundary rather than switching on at it: a hard
+        # hinge leaves the rate as the only gradient until the budget
+        # is spent, and the step that discovers the boundary has
+        # already crossed it (2026-09-22: the mask collapsed to a
+        # twentieth of the field in eighty steps that way).
+        softness = rule.lossless_hinge_softness_db
+        quality = softness * torch.nn.functional.softplus(excess / softness)
+    else:
+        quality = torch.relu(excess)
+    quality = rule.lossless_quality_scale * quality
+    rate = keep.mean()
+    loss = torch.maximum(quality, rate)
+    return loss, {
+        "lossless": loss.item(), "lossless_quality": quality.item(),
+        "lossless_rate": rate.item(), "lossless_excess_db": excess.item(),
+        **measured,
+    }
+
+
+class RateController:
+    """
+    The same constraint as lossless_loss, held with a multiplier
+    instead of a maximum: the loss is the photometric one plus
+    'weight' per unit of mean keep, and the weight is raised while the
+    render is inside the budget and lowered while it is outside,
+
+        w <- w + rate * (tolerance - drop in dB)
+
+    clamped to [minimum, maximum], one weight per context view count
+    since the slack differs by an order of magnitude between them.
+
+    This is dual ascent on 'prune as much as possible while losing at
+    most tolerance_db', and it is what the maximum cannot do from a
+    starting point that already violates the constraint: there the
+    quality branch is hundreds of times the photometric loss, gradient
+    clipping makes every step maximal, and the run walks off (the mask
+    collapsed to a seventh of the field on 2026-09-22 that way). Here
+    the gradient a step takes is always the size of the photometric
+    loss, and only the pressure on the rate moves, slowly.
+    """
+    def __init__(self, rule: "LearnedRule"):
+        self.rule = rule
+        self.weights: Dict[int, float] = {}
+
+    def weight(self, key: int) -> float:
+        return self.weights.setdefault(key, self.rule.rate_weight_initial)
+
+    def update(self, key: int, drop_db: float) -> float:
+        """
+        The weight after a step that lost 'drop_db' at this view count,
+        moved by the slack it left and bounded per step so that one bad
+        scene cannot swing the pressure.
+
+        The move is additive and the weight may go negative, which is a
+        bonus per unit kept rather than a price: a multiplier that can
+        only fall to zero leaves nothing pushing the mask back up, and
+        the photometric loss alone does not do it - the render is
+        nearly flat in the mask over a wide range (probed 2026-09-22:
+        PSNR against the truth moves by 0.01 dB between a mask kept at
+        61% and at 68%), so with no pressure the mask drifts, and it
+        drifted down through three dB of loss.
+        """
+        weight = self.weight(key)
+        step = self.rule.rate_controller_step * (self.rule.lossless_tolerance_db - drop_db)
+        step = max(min(step, self.rule.rate_controller_max_step), -self.rule.rate_controller_max_step)
+        weight = weight + step
+        weight = max(min(weight, self.rule.rate_weight_maximum), self.rule.rate_weight_minimum)
+        self.weights[key] = weight
+        return weight
+
+
+def rate_term(rule: LearnedRule, keep: Tensor, num_gaussians: int) -> Tensor:
+    """
+    What the loss charges per unit kept, as a share of the field, with
+    the pressure scaled by how large the field is:
+
+        rate = mean keep * (reference / N) ** exponent
+
+    At exponent 0 it is the plain kept share, which pushes as hard on a
+    field of a million as on one of a hundred thousand; above it the
+    pressure falls with the size, so that a dense field - which is the
+    one a mask damages most, and the one whose view count the refiner
+    was trained on least - is pruned more carefully. The reference is
+    the size the exponent leaves untouched (2 context views of
+    YoNoSplat, 100,352).
+
+    Unlike a weight per context view count, this is a function of the
+    field the step is holding, so it says something about a count the
+    run never trained on: the 24, 32 and 64-view fields the benchmark
+    ends on.
+    """
+    rate = keep.mean()
+    if rule.rate_size_exponent == 0.0:
+        return rate
+    scale = (rule.rate_reference_gaussians / max(num_gaussians, 1)) ** rule.rate_size_exponent
+    return rate * scale
+
+
+def psnr_drop(rendered: Tensor, reference: Tensor, truth: Tensor) -> float:
+    """
+    How many dB of PSNR against the truth the render loses against the
+    reference render, positive when it is the worse of the two.
+    """
+    ours = (rendered.detach().float() - truth).pow(2).mean().item()
+    theirs = (reference.detach().float() - truth).pow(2).mean().item()
+    return 10.0 * math.log10(max(ours, 1e-20) / max(theirs, 1e-20))
+
+
 def sparsity_loss(
     rule: LearnedRule, pruned: Pruned, mask_weight: Optional[float] = None
 ) -> Tuple[Tensor, Dict[str, float]]:
@@ -421,6 +645,9 @@ __all__ = [
     "QualityController",
     "apply_rule",
     "degradation_loss",
+    "RateController",
     "gumbel_sigmoid",
+    "lossless_loss",
+    "psnr_drop",
     "sparsity_loss",
 ]

@@ -17,3 +17,9 @@
 	path = anyprune/gaussians/external/Speedy-Splat
 	url = https://github.com/j-alex-hanson/speedy-splat.git
 	branch = speedy-splat
+[submodule "anyprune/gaussians/external/LightGaussian"]
+	path = anyprune/gaussians/external/LightGaussian
+	url = https://github.com/VITA-Group/LightGaussian.git
+[submodule "anyprune/gaussians/external/REFINE"]
+	path = anyprune/gaussians/external/REFINE
+	url = https://github.com/ZhangChen2022/REFINE.git

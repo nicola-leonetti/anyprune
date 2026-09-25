@@ -23,8 +23,23 @@ and LPIPS. The methods:
                                                 at its own count
     <score> top-k + compensation                the top of each score of
                                                 --baseline-scores (RadSplat,
-                                                Speedy-Splat, PUP 3D-GS)
-                                                at the first mask's count
+                                                Speedy-Splat, PUP 3D-GS,
+                                                Mini-Splatting, LightGaussian,
+                                                REFINE, GaussianPOP) at the
+                                                first mask's count
+    GaussianPOP N cycles + compensation         GaussianPOP's own procedure
+                                                at that count: the cut in
+                                                GAUSSIANPOP_CYCLES steps, the
+                                                error measured again before
+                                                each
+    <score> top-k                               the same without the
+                                                compensation (--raw-topk)
+    <score> own rule (...) [+ compensation]     each score cut where its
+                                                paper cuts it (--own-rules):
+                                                RadSplat at t=0.01, the others
+                                                at the share of the field
+                                                their pipelines keep (GaussianPOP's
+                                                in its cycles)
     <score> top-k + compensation + SplatFormer  the same, through the
                                                 refiner trained on such
                                                 fields (--topk-checkpoints)
@@ -84,7 +99,8 @@ from tqdm import tqdm
 from anyprune.datasets import DL3DVDataset, split_scenes
 from anyprune.evaluation import LPIPS, psnr, ssim
 from anyprune.gaussians import (
-    Gaussians, blending_weights, fine_tune, pup_score, radsplat_score, sensitivity_scores,
+    GAUSSIANPOP_CYCLES, Gaussians, blending_weights, fine_tune, gaussianpop_prune, gaussianpop_score,
+    lightgaussian_score, mini_splatting_score, pup_score, radsplat_score, refine_score, sensitivity_scores,
     speedy_splat_score,
 )
 from anyprune.models import SplatFormer, build_reconstructor
@@ -158,6 +174,33 @@ SCORES = {
     "radsplat": ("RadSplat", SERIES_COLORS[3]),
     "speedy-splat": ("Speedy-Splat", SERIES_COLORS[0]),
     "pup": ("PUP 3D-GS", SERIES_COLORS[6]),
+    "mini-splatting": ("Mini-Splatting", SERIES_COLORS[4]),
+    "lightgaussian": ("LightGaussian", SERIES_COLORS[7]),
+    "refine": ("REFINE", SERIES_COLORS[5]),
+    "gaussianpop": ("GaussianPOP", SERIES_COLORS[1]),
+}
+# Where each score's own pipeline cuts a field, for --own-rules: a
+# threshold on the score or the share of the field it keeps, one shot.
+# RadSplat drops every weight under 0.01 (its t_prune). Speedy-Splat
+# prunes 80% three times during densification and 30% five times after
+# it, ending ~10x under 3D-GS (its paper's 10.6x), and PUP 3D-GS 80%
+# then 50% (scripts/full_pruning_pipeline.sh), i.e. 90%: a predicted
+# field is pruned once, so both keep 10%. Mini-Splatting's first
+# simplification draws, without replacement and with probability
+# proportional to its score, sampling_factor times the Gaussians that
+# score above zero (ms/train.py), 0.5 on Mip-NeRF 360. LightGaussian
+# prunes the lowest 66% of its global significance once
+# (scripts/run_prune_finetune.sh, --prune_percent 0.66). REFINE prunes
+# once, 10-70% in its paper, 50% in its README. GaussianPOP cuts 65-70%
+# (75% outdoors) after training, in GAUSSIANPOP_CYCLES steps.
+OWN_RULES = {
+    "radsplat": ("threshold", THRESHOLD),
+    "speedy-splat": ("keep", 0.10),
+    "pup": ("keep", 0.10),
+    "mini-splatting": ("sample", 0.5),
+    "lightgaussian": ("keep", 0.34),
+    "refine": ("keep", 0.5),
+    "gaussianpop": ("cycles", 0.3),
 }
 SUFFIX_REFINED = " + SplatFormer"
 SUFFIX_OPTIMIZED = " + post-optimization"
@@ -178,9 +221,62 @@ class LearnedMask:
         return f"learned mask ({self.label}){SUFFIX_REFINED}"
 
 
-def method_topk(score: str, suffix: str = "", at: Optional[str] = None) -> str:
-    """The row of a top-k by 'score', compensated, with what came after and whose count it was cut at."""
-    return f"{SCORES[score][0]} top-k + compensation{suffix}" + ("" if at is None else f" [at {at}'s count]")
+def method_topk(score: str, suffix: str = "", at: Optional[str] = None, compensate: bool = True) -> str:
+    """The row of a top-k by 'score', compensated or not, with what came after and whose count it was cut at."""
+    return (
+        f"{SCORES[score][0]} top-k" + (" + compensation" if compensate else "") + suffix
+        + ("" if at is None else f" [at {at}'s count]")
+    )
+
+
+def method_own_rule(score: str, compensate: bool) -> str:
+    """The row of a score cut where its own paper cuts it."""
+    kind, value = OWN_RULES[score]
+    rule = {
+        "threshold": f"t={value:g}", "keep": f"keep {value:.0%}", "sample": f"draw {value:g}x",
+        "cycles": f"keep {value:.0%} in {GAUSSIANPOP_CYCLES} cycles",
+    }[kind]
+    return f"{SCORES[score][0]} own rule ({rule})" + (" + compensation" if compensate else "")
+
+
+def method_cycles(compensate: bool = True) -> str:
+    """The row of GaussianPOP's cycled cut at the primary mask's count."""
+    return f"{SCORES['gaussianpop'][0]} {GAUSSIANPOP_CYCLES} cycles" + (" + compensation" if compensate else "")
+
+
+def cycled_indices(field: Gaussians, context: ViewSet, count: int, generator: Generator) -> Tensor:
+    """What GaussianPOP's cycled cut keeps of a field at 'count', as indices into it."""
+    return gaussianpop_prune(
+        field, count, context.poses, context.intrinsics, context.image_shape, generator=generator,
+        batches_per_pass=PRUNING_BATCHES_PER_PASS, max_intersections=DEVICE_MAX_INTERSECTIONS,
+    )
+
+
+def top_indices(values: Tensor, count: int, generator: Generator) -> Tensor:
+    """
+    The indices of the 'count' largest values, ties broken at random
+    (Pruner.order): a score that hands out many zeros, Mini-Splatting's
+    above all, would otherwise fill a count past its non-zero set in the
+    order the field was predicted in, i.e. from one corner of the images.
+    """
+    shuffled = torch.randperm(values.numel(), generator=generator).to(values.device)
+    return shuffled[torch.topk(values[shuffled], count, sorted=False).indices]
+
+
+def own_rule_indices(score: str, values: Tensor, generator: Generator) -> Tensor:
+    """What a score's own rule keeps of a field, as indices into it."""
+    kind, value = OWN_RULES[score]
+    if kind == "threshold":
+        kept = torch.nonzero(values >= value).squeeze(1)
+        return kept if kept.numel() > 0 else values.argmax().reshape(1)
+    if kind == "sample":
+        # A draw without replacement in proportion to the score, as the
+        # top of the log score perturbed by a Gumbel (Pruner.order)
+        count = max(1, int(value * (values > 0).sum().item()))
+        noise = torch.rand(values.numel(), generator=generator).to(values.device).clamp_min(torch.finfo(values.dtype).tiny)
+        keys = values.float().log() - (-noise.log()).log()
+        return torch.topk(keys, count, sorted=False).indices
+    return top_indices(values, max(1, round(value * values.numel())), generator)
 
 
 def style_of(method: str, masks: Sequence[LearnedMask]):
@@ -270,32 +366,41 @@ def compensated(gaussians: Gaussians, predicted: int) -> Gaussians:
 def measure_scores(field: Gaussians, context: ViewSet, which: Sequence[str]) -> Dict[str, Tensor]:
     """
     The scores named in 'which' (keys of SCORES), each one number per
-    Gaussian, measured over the context views: one sweep for RadSplat's
-    and one more for the sensitivities, the Fisher only when PUP's is
-    asked for.
+    Gaussian, measured over the context views: one sweep for RadSplat's,
+    Mini-Splatting's and LightGaussian's, one more for the sensitivities
+    and GaussianPOP's error, the Fisher only when PUP's is asked for, and
+    none for REFINE's, which only reads where the cameras are.
     """
     scores = {}
     kwargs = dict(batches_per_pass=PRUNING_BATCHES_PER_PASS, max_intersections=DEVICE_MAX_INTERSECTIONS)
-    if "radsplat" in which:
+    if "radsplat" in which or "mini-splatting" in which or "lightgaussian" in which:
         measured = blending_weights(field, context.poses, context.intrinsics, context.image_shape, **kwargs)
         scores["radsplat"] = radsplat_score(measured)
+        if "mini-splatting" in which:
+            scores["mini-splatting"] = mini_splatting_score(measured)
+        if "lightgaussian" in which:
+            scores["lightgaussian"] = lightgaussian_score(measured, field)
         del measured
-    if "speedy-splat" in which or "pup" in which:
+    if "speedy-splat" in which or "pup" in which or "gaussianpop" in which:
         sensitivities = sensitivity_scores(
             field, context.poses, context.intrinsics, context.image_shape, fisher="pup" in which, **kwargs,
         )
         if "speedy-splat" in which:
             scores["speedy-splat"] = speedy_splat_score(sensitivities)
+        if "gaussianpop" in which:
+            scores["gaussianpop"] = gaussianpop_score(sensitivities)
         if "pup" in which:
             scores["pup"] = pup_score(sensitivities)
         del sensitivities
+    if "refine" in which:
+        scores["refine"] = refine_score(field, context.poses)
     return scores
 
 
 def evaluate_scene(
     masks: Sequence[LearnedMask], baseline_scores: Sequence[str], topk_refiners: Dict[str, SplatFormer],
     post_steps: int, scorer: Scorer, reconstructor, scene, context_idx, test_idx, scene_idx: int,
-    full_post_optimization: bool = False,
+    full_post_optimization: bool = False, raw_topk: bool = False, own_rules: bool = False,
 ) -> List[dict]:
     """
     Every method on one scene at one view count. The first mask is the
@@ -304,7 +409,10 @@ def evaluate_scene(
     fields when there is one for its score, and after post_steps of
     per-scene optimization when asked for; every other mask is scored
     at its own count against the raw top-k of its own score there. The
-    threshold keeps whatever scores above it.
+    threshold keeps whatever scores above it. With 'raw_topk' every
+    baseline is also scored at the primary count without compensation,
+    and with 'own_rules' at its own rule's count (OWN_RULES), with and
+    without, in place of the threshold row.
     """
     with torch.no_grad():
         reconstruction = reconstruct(reconstructor, scene, context_idx, test_idx)
@@ -352,17 +460,33 @@ def evaluate_scene(
             records.append(optimized(mask.method, survivors))
         del pruned, survivors, handed, handed_score
 
-    # The threshold, at its own count
+    # The threshold, at its own count, or every baseline at its own rule's
     with torch.no_grad():
-        kept = torch.nonzero(scores["radsplat"] >= THRESHOLD).squeeze(1)
-        if kept.numel() == 0:
-            kept = scores["radsplat"].argmax().reshape(1)
-        thresholded = compensated(field[kept], predicted)
-        records.append({
-            "method": METHOD_THRESHOLD_COMP, "num_gaussians": thresholded.num_gaussians,
-            **scorer(thresholded, reconstruction),
-        })
-        del thresholded
+        if own_rules:
+            for score in baseline_scores:
+                generator = Generator().manual_seed(SEED + scene_idx)
+                if OWN_RULES[score][0] == "cycles":
+                    kept = field[cycled_indices(field, context, max(1, round(OWN_RULES[score][1] * predicted)), generator)]
+                else:
+                    kept = field[own_rule_indices(score, scores[score], generator)]
+                for compensate in (False, True):
+                    cut = compensated(kept, predicted) if compensate else kept
+                    records.append({
+                        "method": method_own_rule(score, compensate), "num_gaussians": cut.num_gaussians,
+                        **scorer(cut, reconstruction),
+                    })
+                    del cut
+                del kept
+        else:
+            kept = torch.nonzero(scores["radsplat"] >= THRESHOLD).squeeze(1)
+            if kept.numel() == 0:
+                kept = scores["radsplat"].argmax().reshape(1)
+            thresholded = compensated(field[kept], predicted)
+            records.append({
+                "method": METHOD_THRESHOLD_COMP, "num_gaussians": thresholded.num_gaussians,
+                **scorer(thresholded, reconstruction),
+            })
+            del thresholded
 
     # The top of each score at the primary mask's count, compensated,
     # raw, refined and optimized; then the raw top of each other mask's
@@ -372,7 +496,14 @@ def evaluate_scene(
             count = counts[mask.label]
             for score in (baseline_scores if i == 0 else [mask.score]):
                 at = None if i == 0 else mask.label
-                matched = compensated(field[torch.topk(scores[score], count, sorted=False).indices], predicted)
+                top = field[top_indices(scores[score], count, Generator().manual_seed(SEED + scene_idx))]
+                if raw_topk:
+                    records.append({
+                        "method": method_topk(score, at=at, compensate=False), "num_gaussians": top.num_gaussians,
+                        **scorer(top, reconstruction),
+                    })
+                matched = compensated(top, predicted)
+                del top
                 records.append({
                     "method": method_topk(score, at=at), "num_gaussians": matched.num_gaussians,
                     **scorer(matched, reconstruction),
@@ -380,6 +511,19 @@ def evaluate_scene(
                 if i > 0:
                     del matched
                     continue
+                if score == "gaussianpop":
+                    cycled = field[cycled_indices(field, context, count, Generator().manual_seed(SEED + scene_idx))]
+                    if raw_topk:
+                        records.append({
+                            "method": method_cycles(compensate=False), "num_gaussians": cycled.num_gaussians,
+                            **scorer(cycled, reconstruction),
+                        })
+                    cycled = compensated(cycled, predicted)
+                    records.append({
+                        "method": method_cycles(), "num_gaussians": cycled.num_gaussians,
+                        **scorer(cycled, reconstruction),
+                    })
+                    del cycled
                 refiner = topk_refiners.get(score)
                 if refiner is not None:
                     try:
@@ -521,6 +665,11 @@ def main():
     parser.add_argument("--full-post-optimize", action="store_true",
                         help="with --post-optimize, also the whole prediction after as many steps: what the "
                              "optimization is worth at the full count")
+    parser.add_argument("--raw-topk", action="store_true",
+                        help="also score every baseline top-k at the mask's count without compensation")
+    parser.add_argument("--own-rules", action="store_true",
+                        help="score every baseline at the count its own rule keeps (OWN_RULES), with and "
+                             "without compensation, in place of the threshold row")
     parser.add_argument("--importance", action="store_true",
                         help="the learned refiners were trained with the importance input")
     parser.add_argument("--run-name", default=None, help="what to file the results under; the primary checkpoint's stem by default")
@@ -587,6 +736,8 @@ def main():
             "checkpoints": checkpoints, "importance_input": args.importance,
             "masks": [{"label": m.label, "score": m.score, "reference": m.reference} for m in masks],
             "baseline_scores": args.baseline_scores, "post_optimize": args.post_optimize,
+            "raw_topk": args.raw_topk,
+            "own_rules": {s: OWN_RULES[s] for s in args.baseline_scores} if args.own_rules else None,
             "scenes": [Path(dataset.scenes[idx]).name for idx in test_scenes],
             "records": records, "summary": summarize(records),
         }, indent=2))
@@ -610,6 +761,7 @@ def main():
                     masks, args.baseline_scores, topk_refiners, args.post_optimize, scorer, reconstructor,
                     scene, context_idx[:views], test_idx[:views], scene_idx,
                     full_post_optimization=args.full_post_optimize,
+                    raw_topk=args.raw_topk, own_rules=args.own_rules,
                 )
             except RuntimeError as error:
                 if not out_of_memory(error):

@@ -147,6 +147,81 @@ pruning:
       reference: input
       against_truth: false
       power: 2.0
+    # Prune as much as possible while the render stays within a budget
+    # of the unpruned one, rather than trading rate against quality at
+    # a weight: the loss is the larger of what the cut costs and what
+    # it keeps (see anyprune.training.learned_pruning.lossless_loss).
+    # With it on, the photometric loss and the mask sparsity term are
+    # replaced by it - photometric_weight adds the first back.
+    # The excess is measured in dB (see the module), so the loss is a
+    # few units a few dB out rather than a hundred.
+    # tolerance_reference 'truth' reads the budget as the share of the
+    # unpruned render's own error that costs tolerance_db of PSNR (the
+    # truth as a scale only, never differentiated); 'fixed' reads it as
+    # the error of a render quality_floor_db from the unpruned one, and
+    # needs no truth at all.
+    lossless:
+      enabled: false
+      # 'deviation' charges every difference from the unpruned render,
+      # improvements included, and keeps the truth out of the gradient;
+      # 'drop' charges only the PSNR lost against the truth.
+      quality: deviation
+      # What the loss is measured against: the field the refiner was
+      # handed ('input'), which asks for a pipeline that does not lose
+      # against the reconstructor and is infeasible wherever the
+      # refiner itself loses (at 16 views it costs 1.3 dB, so no mask
+      # can be within 0.1 dB of the input); or the refined field left
+      # whole ('refined'), which asks only that the *cut* adds no
+      # damage and is feasible everywhere.
+      reference: input
+      tolerance_db: 0.1
+      tolerance_reference: truth
+      quality_floor_db: 40.0
+      # How hard the constraint is held: the equilibrium is rate/scale
+      # of a dB outside the budget
+      quality_scale: 8.0
+      hinge: true
+      # Over how many dB the hinge softens, so that the quality term
+      # is already pushing back as the boundary is approached; 0 is
+      # the hard hinge, which oscillates
+      hinge_softness_db: 0.1
+      # The photometric loss kept on top, which is what stops the
+      # refiner itself from being dragged along by the rate
+      photometric_weight: 1.0
+      # Hold the constraint with a multiplier on the rate instead of
+      # the maximum (dual ascent, see RateController): the loss is the
+      # photometric one plus weight per unit of mean keep, and the
+      # weight climbs by controller_step per dB of slack a step leaves
+      # and falls the same way per dB of loss over the tolerance, one
+      # weight per context view count. Steadier than the maximum
+      # wherever the constraint starts violated, which at 16 views it
+      # does.
+      controller: true
+      # Lowered fivefold on 2026-09-23: at 0.05 per dB the weight could
+      # swing from full pressure to full bonus in ten steps while the
+      # mask head needs fifty to follow, and the kept share oscillated
+      # 63 -> 51 -> 95 -> 22 per cent at 2 views
+      controller_step: 0.002
+      controller_max_step: 0.005
+      weight_initial: 0.005
+      # Negative: below zero the weight is a bonus per unit kept, which
+      # is what pushes the mask back up while the budget is overspent.
+      # The band is narrow on purpose: this recipe trains stably with a
+      # sparsity weight of 0.01, and a controller allowed to reach 0.5
+      # walked there in twenty-five slack steps and pruned every run to
+      # a twentieth of the field (2026-09-23, four variants).
+      weight_minimum: -0.05
+      weight_maximum: 0.05
+      # The pressure on the rate falls as (reference / N) ** exponent
+      # with the size of the field, so that a dense field is pruned
+      # more carefully; 0 is the plain kept share. Unlike a weight per
+      # view count this carries to the counts the run never trains on.
+      reference_gaussians: 100_352
+      size_exponent: 0.0
+      # One weight for every view count rather than one each, which the
+      # scaling above is what makes possible
+      controller_shared: false
+
     # Put back the optical depth of what the rule drops, by raising the
     # opacities of what it keeps as compensation.* does for a budget:
     # softly during training, on the hard cut at inference. Independent

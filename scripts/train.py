@@ -51,7 +51,7 @@ from anyprune.models.utils import (
 from anyprune.training import (
     BudgetHistogram, LearnedRule, LossHistogram, PhotometricLoss, Pruned,
     QualityController, ViewSet, apply_rule, degradation_loss, fit_budget_fraction,
-    plan_context_views, reconstruct,
+    RateController, lossless_loss, plan_context_views, psnr_drop, rate_term, reconstruct,
     sample_budget_fraction, sample_num_context_views, sparsity_loss,
 )
 from anyprune.utils import load_dotenv, out_of_memory, set_rng_seed
@@ -292,9 +292,12 @@ def reference_render(cfg, rule: LearnedRule, handed: Gaussians, refined: Gaussia
     the refined field left whole (see LearnedRule). None with the term
     off.
     """
-    if not rule.by_degradation:
+    if not (rule.by_degradation or rule.by_lossless):
         return None
-    field = refined if rule.degradation_reference == "refined" else handed
+    reference = (
+        rule.lossless_reference if rule.by_lossless else rule.degradation_reference
+    )
+    field = refined if reference == "refined" else handed
     with torch.no_grad():
         rendered, _ = field.rasterize(
             views.poses, views.intrinsics, views.image_shape,
@@ -329,6 +332,7 @@ def training_step(
     histogram: Optional[BudgetHistogram] = None,
     loss_histogram: Optional[LossHistogram] = None,
     budget_scale: float = 1.0,
+    rates: Optional[RateController] = None,
     controller: Optional[QualityController] = None,
 ) -> StepResult:
     """
@@ -455,18 +459,46 @@ def training_step(
             views.poses, views.intrinsics, views.image_shape,
             views_per_pass=cfg.device_max_views_per_render,
         )
-        loss, terms = criterion(rendered, views.images)
         reference = reference_render(cfg, rule, reconstruction.gaussians, refined, views)
-        if reference is not None:
-            degradation = degradation_loss(rule, rendered, reference, views.images)
-            loss = loss + degradation
-            terms["degradation"] = degradation.item()
+        if rule.by_lossless and rates is not None:
+            # The constraint on a multiplier: the photometric loss with
+            # the rate weighed at what the steps before this one at
+            # this view count have settled on
+            loss, terms = criterion(rendered, views.images)
+            key = 0 if rule.rate_controller_shared else len(context_idx)
+            mask_weight = rates.weight(key)
+            rate = rate_term(rule, pruned.soft["mask"], refined.num_gaussians)
+            loss = loss + mask_weight * rate
+            quality_gap = psnr_drop(rendered, reference, views.images)
+            terms.update({
+                "lossless_rate": rate.item(), "lossless_drop_db": quality_gap,
+                "rate_weight": rates.update(key, quality_gap),
+            })
             del reference
-        # One scalar and one backward for both: with non-reentrant
-        # gradient checkpointing the graph is freed by the first
-        sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
-        loss = loss + sparsity
-        terms.update(sparsity_terms)
+        elif rule.by_lossless:
+            # The rate against a quality budget: the photometric loss
+            # is not what is minimized here, and is only added when
+            # asked for (see anyprune.training.learned_pruning)
+            loss, terms = lossless_loss(
+                rule, rendered, reference, pruned.soft["mask"], views.images,
+            )
+            if cfg.pruning.learned.lossless.photometric_weight > 0.0:
+                photometric, photometric_terms = criterion(rendered, views.images)
+                loss = loss + cfg.pruning.learned.lossless.photometric_weight * photometric
+                terms.update(photometric_terms)
+            del reference
+        else:
+            loss, terms = criterion(rendered, views.images)
+            if reference is not None:
+                degradation = degradation_loss(rule, rendered, reference, views.images)
+                loss = loss + degradation
+                terms["degradation"] = degradation.item()
+            del reference
+            # One scalar and one backward for both: with non-reentrant
+            # gradient checkpointing the graph is freed by the first
+            sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
+            loss = loss + sparsity
+            terms.update(sparsity_terms)
         if target is not None:
             distill, distill_terms = distillation_loss(cfg, refined, target)
             loss = loss + distill
@@ -499,13 +531,38 @@ def training_step(
             stage_render, _ = pruned.trained.rasterize(
                 stage.poses, stage.intrinsics, stage.image_shape, views_per_pass=len(stage),
             )
-            stage_loss, stage_terms = criterion(stage_render, stage.images)
             reference = reference_render(cfg, rule, reconstruction.gaussians, refined, stage)
-            if reference is not None:
-                degradation = degradation_loss(rule, stage_render, reference, stage.images)
-                stage_loss = stage_loss + degradation
-                stage_terms["degradation"] = degradation.item()
+            if rule.by_lossless and rates is not None:
+                stage_loss, stage_terms = criterion(stage_render, stage.images)
+                rate = rate_term(rule, pruned.soft["mask"], refined.num_gaussians)
+                stage_loss = stage_loss + rates.weight(
+                    0 if rule.rate_controller_shared else len(context_idx)
+                ) * rate
+                stage_terms.update({
+                    "lossless_rate": rate.item(),
+                    "lossless_drop_db": psnr_drop(stage_render, reference, stage.images),
+                })
                 del reference
+            elif rule.by_lossless:
+                # Per stage, the whole rate against this stage's share
+                # of the budget: the max cannot be taken over views the
+                # backward has not reached yet, and a stage stands in
+                # for the window the way its photometric loss does
+                stage_loss, stage_terms = lossless_loss(
+                    rule, stage_render, reference, pruned.soft["mask"], stage.images,
+                )
+                if cfg.pruning.learned.lossless.photometric_weight > 0.0:
+                    photometric, photometric_terms = criterion(stage_render, stage.images)
+                    stage_loss = stage_loss + cfg.pruning.learned.lossless.photometric_weight * photometric
+                    stage_terms.update(photometric_terms)
+                del reference
+            else:
+                stage_loss, stage_terms = criterion(stage_render, stage.images)
+                if reference is not None:
+                    degradation = degradation_loss(rule, stage_render, reference, stage.images)
+                    stage_loss = stage_loss + degradation
+                    stage_terms["degradation"] = degradation.item()
+                    del reference
             # The shared graph above the leaves is kept for the next
             # stage; the render's own is freed with its outputs
             scaler.scale(stage_loss * share / loss_scale).backward(retain_graph=True)
@@ -514,10 +571,15 @@ def training_step(
                 terms[name] = terms.get(name, 0.0) + value * share
             rendered_stages.append(stage_render.detach())
             del stage_render, stage_loss
-        sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
-        scaler.scale(sparsity / loss_scale).backward()
-        reported += sparsity.item()
-        terms.update(sparsity_terms)
+        if rule.by_lossless and rates is not None:
+            terms["rate_weight"] = rates.update(
+                0 if rule.rate_controller_shared else len(context_idx), terms["lossless_drop_db"]
+            )
+        if not rule.by_lossless:
+            sparsity, sparsity_terms = sparsity_loss(rule, pruned, mask_weight=mask_weight)
+            scaler.scale(sparsity / loss_scale).backward()
+            reported += sparsity.item()
+            terms.update(sparsity_terms)
         rendered = torch.cat(rendered_stages, dim=0)
         del rendered_stages
         # The distillation term reads the refined field itself, so it
@@ -1370,12 +1432,31 @@ def main(cfg):
         degradation_reference=cfg.pruning.learned.degradation.reference,
         degradation_against_truth=cfg.pruning.learned.degradation.against_truth,
         degradation_power=cfg.pruning.learned.degradation.power,
+        lossless_enabled=cfg.pruning.learned.lossless.enabled,
+        lossless_quality=cfg.pruning.learned.lossless.quality,
+        lossless_tolerance_db=cfg.pruning.learned.lossless.tolerance_db,
+        lossless_tolerance_reference=cfg.pruning.learned.lossless.tolerance_reference,
+        lossless_quality_floor_db=cfg.pruning.learned.lossless.quality_floor_db,
+        lossless_quality_scale=cfg.pruning.learned.lossless.quality_scale,
+        lossless_hinge=cfg.pruning.learned.lossless.hinge,
+        lossless_hinge_softness_db=cfg.pruning.learned.lossless.hinge_softness_db,
+        rate_controller=cfg.pruning.learned.lossless.controller,
+        rate_controller_step=cfg.pruning.learned.lossless.controller_step,
+        rate_controller_max_step=cfg.pruning.learned.lossless.controller_max_step,
+        rate_weight_initial=cfg.pruning.learned.lossless.weight_initial,
+        rate_weight_minimum=cfg.pruning.learned.lossless.weight_minimum,
+        rate_weight_maximum=cfg.pruning.learned.lossless.weight_maximum,
+        rate_reference_gaussians=cfg.pruning.learned.lossless.reference_gaussians,
+        rate_size_exponent=cfg.pruning.learned.lossless.size_exponent,
+        rate_controller_shared=cfg.pruning.learned.lossless.controller_shared,
+        lossless_reference=cfg.pruning.learned.lossless.reference,
         compensate=cfg.pruning.learned.compensate,
         compensation_exponent=cfg.compensation.exponent,
     )
     controller = (
         QualityController(rule) if rule.mask and rule.quality_margin is not None else None
     )
+    rates = RateController(rule) if rule.by_lossless and rule.rate_controller else None
 
     criterion = PhotometricLoss(
         l1_weight=cfg.optim.l1_loss_weight,
@@ -1559,6 +1640,7 @@ def main(cfg):
                     generator, pruner, rule, histogram=histogram,
                     loss_histogram=loss_histogram, budget_scale=budget_scale,
                     controller=controller,
+                    rates=rates,
                 )
                 break
             except RuntimeError as error:

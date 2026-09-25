@@ -3,7 +3,9 @@ This module exposes the features used to define a training step.
 """
 from .balancing import BudgetHistogram, LossHistogram
 from .learned_pruning import (
-    LearnedRule, Pruned, QualityController, apply_rule, degradation_loss, gumbel_sigmoid,
+    LearnedRule, Pruned, QualityController, RateController, apply_rule, degradation_loss,
+    gumbel_sigmoid, psnr_drop, rate_term,
+    lossless_loss,
     sparsity_loss,
 )
 from .losses import PhotometricLoss
@@ -23,6 +25,10 @@ __all__ = [
     "QualityController",
     "apply_rule",
     "degradation_loss",
+    "RateController",
+    "lossless_loss",
+    "psnr_drop",
+    "rate_term",
     "Reconstruction",
     "ViewSet",
     "fit_budget_fraction",

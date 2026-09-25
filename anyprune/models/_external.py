@@ -9,7 +9,9 @@ the equally generic 'models', 'utils' and 'dataset'. Only one repository
 can answer to a given name at a time.
 To solve that, owns() lends its top-level names to one repository for as
 long as it takes to import from it, and parks the modules of the others
-meanwhile.
+meanwhile. The pruning codebases under anyprune/gaussians/external/ that
+this project imports from, LightGaussian and REFINE, are lent their
+names the same way: LightGaussian also claims 'utils'.
 """
 import enum
 import sys
@@ -29,6 +31,17 @@ _TOP_LEVEL_PACKAGES: dict[str, Tuple[str, ...]] = {
     "AnySplat": ("src",),
     "YoNoSplat": ("src",),
     "SplatFormer": ("models", "utils", "dataset"),
+    "LightGaussian": (
+        "arguments", "gaussian_renderer", "lpipsPyTorch", "prune", "scene",
+        "utils", "vectree",
+    ),
+    "REFINE": ("REFINE_pruning",),
+}
+
+# Where a repository lives when it is not under external/ here
+_ROOTS: dict[str, Path] = {
+    "LightGaussian": EXTERNAL_ROOT.parents[1] / "gaussians" / "external" / "LightGaussian",
+    "REFINE": EXTERNAL_ROOT.parents[1] / "gaussians" / "external" / "REFINE",
 }
 
 # The top-level modules of every repository imported so far, keyed by
@@ -72,7 +85,7 @@ def owns(repository: str) -> Iterator[None]:
         _parked[previous_owner] = _take_modules(_TOP_LEVEL_PACKAGES[previous_owner])
     sys.modules.update(_parked.pop(repository, {}))
 
-    root = str(EXTERNAL_ROOT / repository)
+    root = str(_ROOTS.get(repository, EXTERNAL_ROOT / repository))
     sys.path.insert(0, root)
     _owner = repository
     try:

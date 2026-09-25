@@ -24,7 +24,8 @@ from .importance import BlendingWeights, SCORES, blending_weights, score_of
 #     own baseline and the only thing the uniform score can do
 #   - 'top-k' keeps the highest scores, which is RadSplat's threshold
 #     written as a budget: the same order, cut where the budget falls
-#     rather than where the threshold does
+#     rather than where the threshold does. It is LightGaussian's cut
+#     as it stands, which drops a share of the field from the bottom
 #   - 'weighted' draws without replacement with probability
 #     proportional to the score, which is what Mini-Splatting does, and
 #     is not the same thing as the top of it: it keeps some of the low
@@ -110,7 +111,7 @@ class Pruner:
 
         'measured' is a sweep over those same views that the caller has
         already made, which saves rendering the field again: every rule
-        that reads a score reads it off the same four numbers, so a
+        that reads a score reads it off the same five numbers, so a
         caller ranking one field under several rules measures it once.
         """
         num_gaussians = gaussians.num_gaussians
@@ -127,7 +128,7 @@ class Pruner:
             f"The measurement is of {measured.num_gaussians:,} Gaussians "
             f"and the field holds {num_gaussians:,}"
         )
-        keys = score_of(self.score, measured)
+        keys = score_of(self.score, measured, gaussians)
         if self.selection == "weighted":
             # Drawing without replacement with probability proportional
             # to the score, all at once: perturbing each log score by a
@@ -146,7 +147,7 @@ class Pruner:
         # Ties broken at random rather than by the order the
         # reconstructor happened to predict them in, which in a
         # feed-forward field is the order of the pixels they were
-        # predicted from. Both scores hand out a great many zeros -
+        # predicted from. Every score hands out a great many zeros -
         # everything no ray ever stopped on - and a budget wider than
         # what scored above zero would otherwise be filled with one
         # corner of the image.

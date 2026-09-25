@@ -1,8 +1,9 @@
 """
-The two sensitivity scores of Hanson et al., measured on a predicted
-field the way their per-scene code measures them on an optimized one:
-from the derivative of every rendered pixel with respect to every
-Gaussian, pixel by pixel, over the training views.
+The two sensitivity scores of Hanson et al., and GaussianPOP's error,
+measured on a predicted field the way their per-scene code measures
+them on an optimized one: from the derivative of every rendered pixel
+with respect to every Gaussian, pixel by pixel, over the training
+views.
 
 PUP 3D-GS (CVPR 2025, arXiv:2406.10219, anyprune/gaussians/external/
 PUP-3DGS) scores a Gaussian by the log determinant of the Fisher
@@ -41,15 +42,32 @@ the Fisher; the mean also moves the colour, through the viewing
 direction of the harmonics, and that path is added the way the
 rasterizer's backward carries it. The renders composite onto black, as this project's do.
 
-Both scores are measured over the views the reconstructor was given,
-like the blending-weight scores.
+GaussianPOP (Lee et al., arXiv:2602.06830; no code released) scores a
+Gaussian by the squared error its removal leaves in the renders,
+
+    dSE_k = sum_{I, p} || T_kp alpha_kp (c_k - b_{k+1,p}) ||^2
+    b_{k+1,p} = (C_p - P_kp) / T_{k+1,p}
+
+with b what the ray shows behind it and C the rendered pixel: taking
+the Gaussian out lets the light it held through to b. Since
+T_kp (1 - alpha_kp) = T_{k+1,p}, T_kp (c_k - b_{k+1,p}) is the d I / d
+alpha above, and the error is alpha^2 times its square: the same sweep
+answers it with one more sum. Where the paper names c_k the base colour
+this takes the colour the Gaussian shows that view, which is what the
+render it differentiates blends. Its post-training procedure cuts the
+budget in eight cycles and measures the error again on what is left
+before each, since removing a Gaussian changes the light that reaches
+the ones behind it (gaussianpop_prune below).
+
+All three scores are measured over the views the reconstructor was
+given, like the blending-weight scores.
 """
 from dataclasses import dataclass
 from typing import Iterator, Optional, Tuple
 
 import gsplat
 import torch
-from torch import Tensor
+from torch import Generator, Tensor
 
 from .gaussians import Gaussians, view_matrices
 from .importance import _BATCHES_PER_PASS, sweep
@@ -57,6 +75,10 @@ from .importance import _BATCHES_PER_PASS, sweep
 # The sweep's intersections are worked in slices of at most this many,
 # since every one of them carries a 6-vector and 21 products here
 _INTERSECTIONS_PER_SLICE = 2_000_000
+
+# How many cycles GaussianPOP's post-training cut is spread over (C in
+# its section on post-training simplification)
+GAUSSIANPOP_CYCLES = 8
 
 # Row and column of each of the 21 entries of the upper triangle of a
 # 6 x 6 symmetric matrix, in the order the Fisher is accumulated in
@@ -75,6 +97,8 @@ class Sensitivities:
     fisher: Optional[Tensor]
     # (N,) Speedy-Splat's sum of squared kernel derivatives
     speedy: Tensor
+    # (N,) GaussianPOP's squared error of removing it
+    gaussianpop: Tensor
 
     @property
     def num_gaussians(self) -> int:
@@ -311,20 +335,25 @@ def sensitivity_scores(
     **kwargs,
 ) -> Sensitivities:
     """
-    Both sensitivities of the module docstring, measured over V views
-    given the way Gaussians.rasterize() takes them, in one sweep
-    (derivatives() takes the keyword arguments). With 'fisher' off only
-    Speedy-Splat's is measured, at about the cost of a RadSplat sweep,
-    and the Fisher comes back None.
+    The scores of the module docstring, measured over V views given the
+    way Gaussians.rasterize() takes them, in one sweep (derivatives()
+    takes the keyword arguments). With 'fisher' off only Speedy-Splat's
+    and GaussianPOP's are measured, at about the cost of a RadSplat
+    sweep, and the Fisher comes back None.
     """
     opacities = gaussians.opacities.float().clamp(0.0, 1.0)
     measured = Sensitivities(
         fisher=None if not fisher else torch.zeros(gaussians.num_gaussians, 21, device=gaussians.device),
         speedy=torch.zeros(gaussians.num_gaussians, device=gaussians.device),
+        gaussianpop=torch.zeros(gaussians.num_gaussians, device=gaussians.device),
     )
     for it in derivatives(gaussians, poses, intrinsics, image_shape, fisher=fisher, **kwargs):
         measured.speedy.index_add_(
             0, it.gaussian_ids, (opacities[it.gaussian_ids] * it.d_alpha.sum(dim=-1)) ** 2
+        )
+        # What the pixel loses with the Gaussian: alpha d I / d alpha
+        measured.gaussianpop.index_add_(
+            0, it.gaussian_ids, (it.alphas.unsqueeze(-1) * it.d_alpha).square().sum(dim=-1)
         )
         if not fisher:
             continue
@@ -366,10 +395,56 @@ def speedy_splat_score(measured: Sensitivities) -> Tensor:
     return measured.speedy
 
 
+def gaussianpop_score(measured: Sensitivities) -> Tensor:
+    """GaussianPOP's error criterion: the squared error of removing each Gaussian."""
+    return measured.gaussianpop
+
+
+@torch.no_grad()
+def gaussianpop_prune(
+    gaussians: Gaussians,
+    num_gaussians: int,
+    poses: Tensor,
+    intrinsics: Tensor,
+    image_shape: Tuple[int, int],
+    cycles: int = GAUSSIANPOP_CYCLES,
+    generator: Optional[Generator] = None,
+    **kwargs,
+) -> Tensor:
+    """
+    The indices of the 'num_gaussians' of a field that GaussianPOP's
+    post-training procedure keeps: the cut spread evenly over 'cycles',
+    each dropping the lowest error of what the cycles before it left,
+    measured again over the same views (derivatives() takes the keyword
+    arguments). Ties are broken at random, seeded by 'generator' (a CPU
+    one), the way Pruner.order breaks them.
+    """
+    assert cycles > 0, f"GaussianPOP needs at least one cycle, got {cycles}"
+    total = gaussians.num_gaussians
+    kept = torch.arange(total, device=gaussians.device)
+    if num_gaussians >= total:
+        return kept
+    for cycle in range(1, cycles + 1):
+        target = total - round(cycle * (total - num_gaussians) / cycles)
+        if target >= kept.numel():
+            continue
+        errors = sensitivity_scores(
+            gaussians[kept], poses, intrinsics, image_shape, fisher=False, **kwargs
+        ).gaussianpop
+        shuffled = torch.randperm(kept.numel(), generator=generator).to(errors.device)
+        top = shuffled[torch.topk(errors[shuffled], target, sorted=False).indices]
+        kept = kept[top]
+        del errors
+    return kept
+
+
 __all__ = [
     "Derivatives",
+    "GAUSSIANPOP_CYCLES",
     "Sensitivities",
     "derivatives",
+    "gaussianpop_prune",
+    "gaussianpop_score",
     "projection_jacobian",
     "pup_score",
     "sensitivity_scores",
