@@ -673,7 +673,9 @@ def main():
     parser.add_argument("--importance", action="store_true",
                         help="the learned refiners were trained with the importance input")
     parser.add_argument("--run-name", default=None, help="what to file the results under; the primary checkpoint's stem by default")
-    parser.add_argument("--num-scenes", type=int, default=None, help="how many test scenes, all by default")
+    parser.add_argument("--num-scenes", type=int, default=None, help="how many scenes of the split, all by default")
+    parser.add_argument("--split", choices=("test", "val"), default="test",
+                        help="the DL3DV split to score on: the test one, or the validation one for choosing between recipes")
     parser.add_argument("--context-views", type=int, nargs="+", default=EVAL_CONTEXT_VIEWS)
     parser.add_argument("--wandb", choices=("online", "offline", "disabled"), default="online")
     args = parser.parse_args()
@@ -690,7 +692,7 @@ def main():
     device = torch.device("cuda")
 
     dataset = DL3DVDataset(str(DL3DV_ROOT_DIR), DL3DV_IMAGES_SUBDIR)
-    test_scenes = split_scenes(len(dataset), SPLITS, SPLIT_SEED)["test"]
+    test_scenes = split_scenes(len(dataset), SPLITS, SPLIT_SEED)[args.split]
     if args.num_scenes is not None:
         test_scenes = test_scenes[:args.num_scenes]
 
@@ -716,7 +718,7 @@ def main():
     window = 2 * max(args.context_views)
     print(
         f"Evaluating the learned masks {[mask.label for mask in masks]} on {len(test_scenes)} scenes of the "
-        f"DL3DV test split, windows of {window} frames, from {args.context_views} context views, against the "
+        f"DL3DV {args.split} split, windows of {window} frames, from {args.context_views} context views, against the "
         f"{[SCORES[s][0] for s in args.baseline_scores]} top-k at the count of {masks[0].label!r}"
         + (f", each also after {args.post_optimize} steps of per-scene optimization" if args.post_optimize else "")
         + f". Writing to {output_dir}"
@@ -725,7 +727,7 @@ def main():
     if use_wandb:
         wandb.init(
             project=WANDB_PROJECT, mode=args.wandb, name=f"{run_name}-eval", job_type="eval",
-            config={"checkpoints": checkpoints, "num_scenes": len(test_scenes),
+            config={"checkpoints": checkpoints, "num_scenes": len(test_scenes), "split": args.split,
                     "context_views": args.context_views, "importance_input": args.importance,
                     "baseline_scores": args.baseline_scores, "post_optimize": args.post_optimize},
             settings=wandb.Settings(x_disable_stats=True),
@@ -738,7 +740,7 @@ def main():
             "baseline_scores": args.baseline_scores, "post_optimize": args.post_optimize,
             "raw_topk": args.raw_topk,
             "own_rules": {s: OWN_RULES[s] for s in args.baseline_scores} if args.own_rules else None,
-            "scenes": [Path(dataset.scenes[idx]).name for idx in test_scenes],
+            "split": args.split, "scenes": [Path(dataset.scenes[idx]).name for idx in test_scenes],
             "records": records, "summary": summarize(records),
         }, indent=2))
 
@@ -783,7 +785,7 @@ def main():
     summary = summarize(records)
     assert summary, "No scene was measured: nothing to report"
     report = [
-        f"Learned masks {[mask.label for mask in masks]}, {len(test_scenes)} DL3DV test scenes; "
+        f"Learned masks {[mask.label for mask in masks]}, {len(test_scenes)} DL3DV {args.split} scenes; "
         f"the baselines at the count of {masks[0].label!r}"
     ]
     for views in args.context_views:
@@ -796,7 +798,7 @@ def main():
     drawn = [style_of(method, masks) for method in methods]
     figure = plot_eval_histogram(
         summary, [RECONSTRUCTOR], args.context_views, [DEVICE_MAX_GAUSSIANS], drawn,
-        title=f"DL3DV test split, {len(test_scenes)} scenes, at the count the learned mask kept",
+        title=f"DL3DV {args.split} split, {len(test_scenes)} scenes, at the count the learned mask kept",
         metrics=METRICS, annotate_counts=True,
     )
     histogram_path = output_dir / "eval_histogram.png"

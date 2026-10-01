@@ -19,6 +19,40 @@ TILE_SIZE = 16
 # The upper triangle of a covariance, in the order gsplat packs it in.
 _TRIANGLE = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
 
+# How many covariances world_rotations() decomposes at once: the
+# batched eigensolver's workspace on the card grows with the batch, and
+# 400k at once did not fit next to a refiner
+_EIGH_CHUNK = 131_072
+
+
+def world_rotations(covariances: Tensor, scales: Tensor) -> Tensor:
+    """
+    (N, 4) real-part-last unit quaternions of the rotations R, in the
+    frame the (N, 3, 3) covariances are written in, for which
+    R diag(scales^2) R^T is those covariances, each of the (N, 3)
+    scales staying on its own axis: an eigendecomposition, its
+    eigenvectors matched to the axes by the order of the scales, and
+    one axis flipped where that leaves a reflection.
+
+    YoNoSplat writes each Gaussian's rotation in the frame of the camera
+    that predicted it and only its covariance in the world frame (its
+    gaussian_adapter rotates R S S^T R^T by the camera's c2w), so the
+    rotation it hands over disagrees with the covariance by that camera's
+    orientation, more the further the capture turns.
+    """
+    from .optimization import _matrix_to_quaternion
+
+    rotations = torch.empty(covariances.shape[0], 4, device=covariances.device, dtype=scales.dtype)
+    for start in range(0, covariances.shape[0], _EIGH_CHUNK):
+        chunk = slice(start, start + _EIGH_CHUNK)
+        _, eigenvectors = torch.linalg.eigh(covariances[chunk].double())  # ascending eigenvalues
+        order = torch.argsort(scales[chunk].double(), dim=-1)            # ascending scales
+        matrices = torch.empty_like(eigenvectors)
+        matrices.scatter_(2, order.unsqueeze(1).expand(-1, 3, -1), eigenvectors)
+        matrices[torch.linalg.det(matrices) < 0, :, 0] *= -1
+        rotations[chunk] = _matrix_to_quaternion(matrices)[:, [1, 2, 3, 0]].to(scales.dtype)
+    return rotations
+
 
 def _tile_intersections(
     means2d: Tensor, radii: Tensor, tile_width: int, tile_height: int
@@ -289,13 +323,15 @@ class Gaussians:
         assert gaussians.means.shape[0] == 1, (
             f"Expected a single scene from YoNoSplat, got a batch of {gaussians.means.shape[0]}"
         )
+        # Its rotations are in the frame of each Gaussian's camera, its
+        # covariances in the world's (see world_rotations)
         return cls(
             means=gaussians.means[0],
             covariances=gaussians.covariances[0],
             harmonics=gaussians.harmonics[0],
             opacities=gaussians.opacities[0],
             scales=gaussians.scales[0],
-            rotations=gaussians.rotations[0],
+            rotations=world_rotations(gaussians.covariances[0], gaussians.scales[0]),
         )
 
     def compensate(

@@ -306,6 +306,49 @@ def reference_render(cfg, rule: LearnedRule, handed: Gaussians, refined: Gaussia
     return rendered
 
 
+def supervised_loss(
+    cfg, rule: LearnedRule, criterion: PhotometricLoss, rendered: Tensor, images: Tensor,
+    reference: Optional[Tensor], first: int = 0,
+) -> Tuple[Tensor, Dict[str, float]]:
+    """
+    The photometric loss and the degradation term of views 'first'
+    onwards of a step's supervised views, as a mean over them, each
+    view paying the terms supervision.truth gives it: 'all' the
+    photometric loss on every view, plus the degradation term with its
+    weight on; 'none' the degradation term alone; 'even' the
+    photometric loss on the views at even positions and the
+    degradation term on the others. Positions count from the first
+    supervised view, so that a stage of a staged backward keeps the
+    parity of the whole window. Each term is logged as its share of
+    the mean.
+    """
+    truth = cfg.supervision.truth
+    if truth == "all":
+        loss, terms = criterion(rendered, images)
+        if reference is not None:
+            degradation = degradation_loss(rule, rendered, reference, images)
+            loss = loss + degradation
+            terms["degradation"] = degradation.item()
+        return loss, terms
+    even = (torch.arange(first, first + len(rendered)) % 2 == 0).tolist()
+    by_truth = [i for i, e in enumerate(even) if e] if truth == "even" else []
+    by_reference = [i for i in range(len(rendered)) if i not in by_truth]
+    loss, terms = rendered.new_zeros(()), {}
+    if by_truth:
+        share = len(by_truth) / len(rendered)
+        photometric, photometric_terms = criterion(rendered[by_truth], images[by_truth])
+        loss = loss + share * photometric
+        terms.update({name: share * value for name, value in photometric_terms.items()})
+    if by_reference:
+        share = len(by_reference) / len(rendered)
+        degradation = degradation_loss(
+            rule, rendered[by_reference], reference[by_reference], images[by_reference]
+        )
+        loss = loss + share * degradation
+        terms["degradation"] = share * degradation.item()
+    return loss, terms
+
+
 def chunks(views: ViewSet, size: int):
     """The views in groups of at most 'size', in order."""
     for first in range(0, len(views), size):
@@ -488,11 +531,7 @@ def training_step(
                 terms.update(photometric_terms)
             del reference
         else:
-            loss, terms = criterion(rendered, views.images)
-            if reference is not None:
-                degradation = degradation_loss(rule, rendered, reference, views.images)
-                loss = loss + degradation
-                terms["degradation"] = degradation.item()
+            loss, terms = supervised_loss(cfg, rule, criterion, rendered, views.images, reference)
             del reference
             # One scalar and one backward for both: with non-reentrant
             # gradient checkpointing the graph is freed by the first
@@ -524,7 +563,7 @@ def training_step(
         pruned = apply_rule(rule, replace(refined, **leaves), logits_leaf, noisy=True)
         optimizer.zero_grad(set_to_none=True)
         rendered_stages, terms, reported = [], {}, 0.0
-        for stage in chunks(views, stage_size):
+        for first, stage in zip(range(0, len(views), stage_size), chunks(views, stage_size)):
             # The mean over every view is the sum of each stage's mean
             # weighed by its share of the views
             share = len(stage) / len(views)
@@ -557,12 +596,10 @@ def training_step(
                     stage_terms.update(photometric_terms)
                 del reference
             else:
-                stage_loss, stage_terms = criterion(stage_render, stage.images)
-                if reference is not None:
-                    degradation = degradation_loss(rule, stage_render, reference, stage.images)
-                    stage_loss = stage_loss + degradation
-                    stage_terms["degradation"] = degradation.item()
-                    del reference
+                stage_loss, stage_terms = supervised_loss(
+                    cfg, rule, criterion, stage_render, stage.images, reference, first=first,
+                )
+                del reference
             # The shared graph above the leaves is kept for the next
             # stage; the render's own is freed with its outputs
             scaler.scale(stage_loss * share / loss_scale).backward(retain_graph=True)
@@ -1414,6 +1451,8 @@ def main(cfg):
         mask_head=cfg.splatformer.mask_head,
         importance_reference=cfg.pruning.learned.importance_reference,
         importance_eps=cfg.pruning.learned.importance_eps,
+        grid_reference_gaussians=cfg.splatformer.grid_reference_gaussians,
+        grid_exponent=cfg.splatformer.grid_exponent,
     ).to(device)
     splatformer.train()
     trainable = sum(p.numel() for p in splatformer.parameters() if p.requires_grad)
@@ -1457,6 +1496,13 @@ def main(cfg):
         QualityController(rule) if rule.mask and rule.quality_margin is not None else None
     )
     rates = RateController(rule) if rule.by_lossless and rule.rate_controller else None
+    assert cfg.supervision.truth in ("all", "none", "even"), (
+        f"supervision.truth is 'all', 'none' or 'even', got {cfg.supervision.truth!r}"
+    )
+    assert cfg.supervision.truth == "all" or (rule.by_degradation and not rule.by_lossless), (
+        f"supervision.truth={cfg.supervision.truth!r} leaves views to the degradation term, "
+        f"which needs its weight on and the lossless objective off"
+    )
 
     criterion = PhotometricLoss(
         l1_weight=cfg.optim.l1_loss_weight,
@@ -1549,6 +1595,11 @@ def main(cfg):
             if cfg.supervision.max_views is None else
             f"at most {cfg.supervision.max_views} of the '{cfg.supervision.views}' views"
         )
+        + {
+            "all": "",
+            "none": " against the render of the input alone (no ground truth)",
+            "even": " (the ground truth on the even ones, the render of the input on the odd ones)",
+        }[cfg.supervision.truth]
         + f", in one graph while its estimate stays "
         f"{cfg.device_memory_safety_margin_gib:g} GiB under the card's "
         f"{torch.cuda.get_device_properties(0).total_memory / 2 ** 30:.1f} GiB and in "

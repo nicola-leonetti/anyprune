@@ -142,6 +142,8 @@ class SplatFormer(nn.Module):
         mask_head: bool = False,
         importance_reference: float = 0.01,
         importance_eps: float = 1e-6,
+        grid_reference_gaussians: Optional[float] = None,
+        grid_exponent: float = 0.25,
     ):
         """
         'importance_input' and 'mask_head' are the two additions
@@ -150,6 +152,11 @@ class SplatFormer(nn.Module):
         A checkpoint written before either addition existed loads into
         either, with the new weights at their initialization; one
         written with them loads exactly.
+
+        'grid_reference_gaussians' makes the voxel grid finer on fields
+        larger than it, by (N / reference) ** grid_exponent (see
+        grid_resolution_for); None keeps the configured grid at every
+        size. No weight depends on the resolution.
         """
         super().__init__()
         self.quiet = quiet
@@ -163,8 +170,12 @@ class SplatFormer(nn.Module):
             f"be positive: got {importance_reference} and {importance_eps}"
         )
         self._capture = None
+        self.grid_reference_gaussians = grid_reference_gaussians
+        self.grid_exponent = grid_exponent
         with _muted(quiet):
             self.model = build_splatformer(config_file)
+        self.base_grid_resolution = self.model.grid_resolution
+        with _muted(quiet):
             if importance_input:
                 self._add_importance_input()
             if mask_head:
@@ -185,6 +196,23 @@ class SplatFormer(nn.Module):
 
     def _batch_norms(self):
         return [m for m in self.modules() if isinstance(m, _BatchNorm)]
+
+    def grid_resolution_for(self, num_gaussians: int) -> int:
+        """
+        The voxel grid a field of this size is serialized and pooled on.
+        A feed-forward field grows with its view count faster than the
+        voxels it occupies do (at 384: 1.2 Gaussians per occupied voxel
+        at 2 views, 3.8 at 16), so on a fixed grid a dense field shares
+        most of its voxels and every stage past the first pools them
+        together. Scaled by (N / reference) ** exponent above the
+        reference, and never coarser than the configured grid: an
+        occupied surface grows with the square of the resolution, so
+        0.25 keeps the Gaussians per voxel about level from 200k up.
+        """
+        if self.grid_reference_gaussians is None:
+            return self.base_grid_resolution
+        ratio = max(1.0, num_gaussians / self.grid_reference_gaussians)
+        return int(round(self.base_grid_resolution * ratio ** self.grid_exponent))
 
     def train(self, mode: bool = True):
         """
@@ -428,6 +456,7 @@ class SplatFormer(nn.Module):
             if self.importance_input:
                 gs[IMPORTANCE_FEATURE] = importance.to(gs["opacities"].dtype)
 
+        self.model.grid_resolution = self.grid_resolution_for(gaussians.num_gaussians)
         features = None
         with self._capture.attached() if self.mask_head else nullcontext():
             with _muted(self.quiet):

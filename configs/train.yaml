@@ -31,6 +31,16 @@ supervision:
   # device_memory_* constants of the machine config); at 8 the loss saw
   # a quarter of a 16-view window.
   max_views: null
+  # What each supervised view is charged against: 'all' the ground
+  # truth on every view, plus the degradation term when its weight is
+  # on; 'none' only the degradation term, against the render of its
+  # reference, so no ground truth at all; 'even' the ground truth on the
+  # views at even positions and the degradation term on the others
+  # (the context views come first and every count is even, so that is
+  # every other context view and every other held-out one, along the
+  # capture). The last two need the
+  # degradation weight on (pruning.learned.degradation).
+  truth: all
 
 # What share of the Gaussians the reconstructor predicted a step keeps
 # (not used if balance is enabled). At 1.0/1.0 with balancing off a
@@ -251,6 +261,13 @@ splatformer:
   # One more output head, predicting a per-Gaussian keep mask over that
   # score, trained with optim.mask_loss_weight
   mask_head: true
+  # Refine a field larger than this many Gaussians on a finer voxel
+  # grid than the 384 SplatFormer was built with, by (N / this) **
+  # grid_exponent, so that a dense field does not pool most of its
+  # Gaussians together past the first stage (3.8 per occupied voxel at
+  # 16 views against 1.2 at 2). null keeps 384 at every size.
+  grid_reference_gaussians: null
+  grid_exponent: 0.25
 
 optim:
   total_steps: 1_500
