@@ -23,3 +23,6 @@
 [submodule "anyprune/gaussians/external/REFINE"]
 	path = anyprune/gaussians/external/REFINE
 	url = https://github.com/ZhangChen2022/REFINE.git
+[submodule "anyprune/models/external/ReSplat"]
+	path = anyprune/models/external/ReSplat
+	url = https://github.com/cvg/resplat.git
