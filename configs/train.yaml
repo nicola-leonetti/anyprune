@@ -110,6 +110,17 @@ pruning:
     # views).
     importance_reference: 0.0125
     importance_eps: 1e-6
+    # Read the score of a field of N Gaussians as S * N / this, so that
+    # its level means the same at every size: Speedy-Splat's falls as
+    # N^-1.02 from 2 to 64 views, which left the mask's logit > 0 keeping
+    # 50% of a 2-view field and 16% of a 64-view one (2026-10-03). At
+    # 100,352 (two views) a 2-view field reads exactly as without it.
+    # null reads the score as it is. Training with it costs 0.1-2 dB at
+    # 10-20% kept on 16-64 views (the mask keeps ~35% throughout, so the
+    # refiner rarely sees a heavy cut; 2026-10-04): it is applied at
+    # evaluation only (scripts/eval_learned.py IMPORTANCE_SIZE_REFERENCE),
+    # where it only moves the model's own cut.
+    importance_size_reference: null
     # A refined Gaussian at or below this opacity is dropped at
     # inference under the opacity rule; 0.005 is the cut 3DGS itself
     # prunes at
@@ -268,6 +279,17 @@ splatformer:
   # 16 views against 1.2 at 2). null keeps 384 at every size.
   grid_reference_gaussians: null
   grid_exponent: 0.25
+  # Apply only (this / N) ** residual_exponent of the adjustment the
+  # network predicts on a field of N Gaussians larger than this, in
+  # training as at inference, so that the loss is taken on what comes
+  # out. null applies all of it. Held out, the whole adjustment
+  # overshoots on dense fields: half of it beat all of it at 16 views
+  # (2026-09-30, at inference only), with 100,352 (two views) and 1/3.
+  # Applied at evaluation (scripts/eval_learned.py RESIDUAL_RULE): trained
+  # with it, the network learns larger adjustments and does worse past 16
+  # views (2026-10-01).
+  residual_reference_gaussians: null
+  residual_exponent: 0.3333
 
 optim:
   total_steps: 1_500
@@ -285,6 +307,11 @@ optim:
     # trained, so it learns at its own rate
     mask: 1e-3
   lr_schedule: constant
+  # Validate and save an exponential moving average of the weights at
+  # this decay instead of the last iterate (scripts/train.py,
+  # WeightAverage); null turns it off. model_final_last.pth keeps the
+  # last iterate next to it.
+  ema_decay: null
   grad_clip_norm: 2.0
   l1_loss_weight: 1.0
   l2_loss_weight: 0.0

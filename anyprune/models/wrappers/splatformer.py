@@ -28,6 +28,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple
 
+import spconv.pytorch as spconv
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -54,6 +55,9 @@ IMPORTANCE_FEATURE = "importance"
 MASK_HEAD = "mask"
 # As wide as SplatFormer's own heads
 _MASK_HEAD_WIDTH = 128
+# What the point orders PTv3 shuffles on every forward are drawn from,
+# when the refiner runs deterministically
+_ORDER_SEED = 0
 
 
 def _widen_linear(linear: nn.Linear, extra: int) -> nn.Linear:
@@ -87,6 +91,75 @@ def _mask_head(input_dim: int, width: int = _MASK_HEAD_WIDTH) -> nn.Sequential:
     head[-1].weight.data.zero_()
     head[-1].bias.data.zero_()
     return head
+
+
+class _UniqueVoxelSubMConv3d(spconv.SubMConv3d):
+    """
+    A submanifold convolution that gives the same answer every time on a
+    field whose Gaussians share voxels (at 16 views 803k Gaussians share
+    357k voxels of the 384 grid), and otherwise the one spconv computes.
+
+    spconv keeps one point per voxel in the hash table it finds
+    neighbours in, decided by a race between GPU threads, and builds the
+    pairs of half the kernel offsets by looking neighbours up and the
+    other half by mirroring them. On shared voxels that gives (checked
+    against a brute-force reference, 2026-10-04):
+
+        out_i = W_centre f_i + b
+              + sum over offsets before the centre of W_k f_{w(v_i + k)}
+              + [i is w(v_i)] * sum over offsets after it of W_k f_{w(v_i + k)}
+
+    with v_i the voxel of point i and w(v) the point that won voxel v.
+    The same here with w(v) the highest index in v: what the race picks
+    for 72% of the shared voxels of a 2-view field and 81% of a 16-view
+    one, and so closest to what the refiner was trained on.
+
+    Every field is convolved here, in torch, shared voxels or not:
+    spconv picks its kernels by timing them once per process, so two
+    processes can sum in different orders (at 64 views their logits
+    differed by ~1e-5).
+    """
+
+    def forward(self, x: spconv.SparseConvTensor) -> spconv.SparseConvTensor:
+        indices = x.indices.long()
+        spans = indices.amax(dim=0) + 1
+
+        def pack(coords: Tensor) -> Tensor:
+            return ((coords[:, 0] * spans[1] + coords[:, 1]) * spans[2] + coords[:, 2]) * spans[3] + coords[:, 3]
+
+        voxel_keys, inverse = torch.unique(pack(indices), return_inverse=True)
+        num_points, num_voxels = indices.shape[0], voxel_keys.numel()
+        assert all(d == 1 for d in self.dilation) and all(k % 2 == 1 for k in self.kernel_size), (
+            "Only odd, undilated kernels are reproduced"
+        )
+        winner = torch.full((num_voxels,), -1, device=indices.device, dtype=torch.long)
+        winner.scatter_reduce_(0, inverse, torch.arange(num_points, device=indices.device), "amax")
+        winner_features, winner_coords = x.features[winner], indices[winner]
+
+        # (out, kx, ky, kz, in), as spconv 2 stores every kernel
+        weight = self.weight
+        centre = tuple(k // 2 for k in self.kernel_size)
+        out = x.features @ weight[(slice(None), *centre)].T
+        if self.bias is not None:
+            out = out + self.bias
+        to_all = torch.zeros(num_voxels, weight.shape[0], device=out.device, dtype=out.dtype)
+        to_winner = torch.zeros_like(to_all)
+        offsets = torch.cartesian_prod(*(torch.arange(k, device=indices.device) for k in self.kernel_size))
+        centre_index = (offsets == torch.tensor(centre, device=indices.device)).all(dim=1).nonzero().item()
+        for k, offset in enumerate(offsets):
+            if k == centre_index:
+                continue
+            neighbour = winner_coords.clone()
+            neighbour[:, 1:] += offset - torch.tensor(centre, device=indices.device)
+            inside = ((neighbour[:, 1:] >= 0) & (neighbour[:, 1:] < spans[1:])).all(dim=1)
+            keys = pack(neighbour.clamp_min(0))
+            found = torch.searchsorted(voxel_keys, keys).clamp_max(num_voxels - 1)
+            hit = inside & (voxel_keys[found] == keys)
+            contribution = winner_features[found[hit]] @ weight[(slice(None), *offset.tolist())].T
+            (to_all if k < centre_index else to_winner).index_add_(0, hit.nonzero().flatten(), contribution)
+        out = out + to_all[inverse]
+        out[winner] += to_winner
+        return x.replace_feature(out)
 
 
 class _HeadInputCapture:
@@ -144,6 +217,10 @@ class SplatFormer(nn.Module):
         importance_eps: float = 1e-6,
         grid_reference_gaussians: Optional[float] = None,
         grid_exponent: float = 0.25,
+        residual_reference_gaussians: Optional[float] = None,
+        residual_exponent: float = 1.0 / 3.0,
+        importance_size_reference: Optional[float] = None,
+        deterministic: bool = False,
     ):
         """
         'importance_input' and 'mask_head' are the two additions
@@ -157,6 +234,25 @@ class SplatFormer(nn.Module):
         larger than it, by (N / reference) ** grid_exponent (see
         grid_resolution_for); None keeps the configured grid at every
         size. No weight depends on the resolution.
+
+        'residual_reference_gaussians' scales what the network adds to
+        each Gaussian down on fields larger than it, by
+        (reference / N) ** residual_exponent (see residual_scale_for),
+        in training as at inference, so that the loss is taken on the
+        Gaussians that come out; None applies the whole residual.
+
+        'importance_size_reference' reads the score of a field of N
+        Gaussians as S * N / reference rather than S (see
+        importance_feature), so that it is on the same scale at every
+        size; None reads it as it is.
+
+        'deterministic' makes refine() give the same output bit for bit
+        on the same input, whatever ran before it: the point orders PTv3
+        shuffles on every forward are drawn from a fixed seed (without
+        touching the global generator), and its sparse convolutions run
+        on one point per voxel (_UniqueVoxelSubMConv3d). Off, the same
+        field refines differently every time, by up to ~3 in a logit.
+        For evaluation; training keeps both random.
         """
         super().__init__()
         self.quiet = quiet
@@ -165,6 +261,7 @@ class SplatFormer(nn.Module):
         self.mask_head = mask_head
         self.importance_reference = importance_reference
         self.importance_eps = importance_eps
+        self.importance_size_reference = importance_size_reference
         assert importance_reference > 0.0 and importance_eps > 0.0, (
             f"The score is read in logs, so its reference and floor have to "
             f"be positive: got {importance_reference} and {importance_eps}"
@@ -172,6 +269,8 @@ class SplatFormer(nn.Module):
         self._capture = None
         self.grid_reference_gaussians = grid_reference_gaussians
         self.grid_exponent = grid_exponent
+        self.residual_reference_gaussians = residual_reference_gaussians
+        self.residual_exponent = residual_exponent
         with _muted(quiet):
             self.model = build_splatformer(config_file)
         self.base_grid_resolution = self.model.grid_resolution
@@ -193,9 +292,24 @@ class SplatFormer(nn.Module):
         if batch_statistics:
             for module in self._batch_norms():
                 module.momentum = 0.0
+        self.deterministic = deterministic
+        if deterministic:
+            for module in self.model.modules():
+                if type(module) is spconv.SubMConv3d:
+                    module.__class__ = _UniqueVoxelSubMConv3d
 
     def _batch_norms(self):
         return [m for m in self.modules() if isinstance(m, _BatchNorm)]
+
+    @contextmanager
+    def _order_generator(self) -> Iterator[None]:
+        """Where PTv3 draws its shuffled point orders from (the CPU generator): seeded and restored after when deterministic."""
+        if not self.deterministic:
+            yield
+            return
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(_ORDER_SEED)
+            yield
 
     def grid_resolution_for(self, num_gaussians: int) -> int:
         """
@@ -213,6 +327,41 @@ class SplatFormer(nn.Module):
             return self.base_grid_resolution
         ratio = max(1.0, num_gaussians / self.grid_reference_gaussians)
         return int(round(self.base_grid_resolution * ratio ** self.grid_exponent))
+
+    def residual_scale_for(self, num_gaussians: int) -> float:
+        """
+        How much of its predicted adjustment the network applies to a
+        field of this size. The refiner's correction does not shrink
+        with density the way the useful one does (on held-out 16-view
+        fields half of it beat all of it, on the context views too), so
+        past the reference it is scaled by (reference / N) ** exponent;
+        1/3 against 100,352 (two views) was chosen on the validation
+        split on 2026-09-30.
+        """
+        if self.residual_reference_gaussians is None:
+            return 1.0
+        return min(1.0, (self.residual_reference_gaussians / num_gaussians) ** self.residual_exponent)
+
+    @staticmethod
+    def _scale_residual(handed: Dict[str, Tensor], refined: Dict[str, Tensor], scale: float) -> Dict[str, Tensor]:
+        """
+        handed + scale * (refined - handed) on every parameter the
+        network writes, in its own parametrization (unit-cube means, log
+        scales, opacity logits, quaternions, harmonics), each an affine
+        image of the field's own, so the same as scaling it there.
+        """
+        out = dict(refined)
+        for key, value in refined.items():
+            base = handed[key].to(value.dtype)
+            if key == "quats":
+                # Towards the rotation the network wrote, as a unit
+                # quaternion, and q and -q being the same rotation,
+                # towards the nearer of the two
+                value = value / value.norm(dim=-1, keepdim=True)
+                flip = torch.where((base * value).sum(-1, keepdim=True) < 0, -1.0, 1.0).to(value.dtype)
+                value = value * flip
+            out[key] = base + scale * (value - base)
+        return out
 
     def train(self, mode: bool = True):
         """
@@ -336,15 +485,25 @@ class SplatFormer(nn.Module):
             f"and with the same importance input and mask head."
         )
 
-    def importance_feature(self, score: Tensor) -> Tensor:
+    def importance_feature(self, score: Tensor, num_gaussians: Optional[int] = None) -> Tensor:
         """
         The (N, 1) channel a score is read as: its log, floored at
         importance_eps, centred on importance_reference.
+
+        With 'importance_size_reference', the score of a field of
+        'num_gaussians' (the whole field's, when the score is a part of
+        it) is read as S * N / reference: a sensitivity shrinks as the
+        field it is measured on grows (Speedy-Splat's by N^-1.02 from 2
+        to 64 views, 2026-10-03), so read as it is, a fixed level of it
+        keeps half of a 2-view field and a sixth of a 64-view one. Its
+        product with N is about level across sizes, and equal to it at
+        the reference.
         """
-        return (
-            score.float().clamp_min(self.importance_eps).log()
-            - math.log(self.importance_reference)
-        ).unsqueeze(-1)
+        feature = score.float().clamp_min(self.importance_eps).log() - math.log(self.importance_reference)
+        if self.importance_size_reference is not None:
+            assert num_gaussians is not None, "A size-relative score needs the size of its field"
+            feature = feature + math.log(num_gaussians / self.importance_size_reference)
+        return feature.unsqueeze(-1)
 
     @property
     def sh_degree(self) -> int:
@@ -424,7 +583,8 @@ class SplatFormer(nn.Module):
         return {**gs, "features_rest": seen.contiguous()}, unseen
 
     def refine(
-        self, gaussians: Gaussians, score: Optional[Tensor] = None
+        self, gaussians: Gaussians, score: Optional[Tensor] = None,
+        field_gaussians: Optional[int] = None,
     ) -> Tuple[Gaussians, Optional[Tensor]]:
         """
         Takes a set of Gaussians and returns the refined set, in the
@@ -436,6 +596,12 @@ class SplatFormer(nn.Module):
         'score' is the (N,) RadSplat score of every Gaussian, needed
         whenever the network reads one (see reads_score) and ignored
         otherwise.
+
+        'field_gaussians' is the size of the whole field when these
+        Gaussians are a part of it (a field refined in spatial chunks),
+        which is the size the residual is scaled by (see
+        residual_scale_for): a part of a dense field is as dense as the
+        whole of it. By default, the size of what is handed over.
 
         The normalization into the unit cube that SplatFormer's voxel
         grid needs happens inside and is undone on the way out, which is
@@ -452,16 +618,21 @@ class SplatFormer(nn.Module):
             assert score.shape == (gaussians.num_gaussians,), (
                 f"One score per Gaussian: got {tuple(score.shape)} for {gaussians.num_gaussians:,}"
             )
-            importance = self.importance_feature(score)
+            importance = self.importance_feature(score, field_gaussians or gaussians.num_gaussians)
             if self.importance_input:
                 gs[IMPORTANCE_FEATURE] = importance.to(gs["opacities"].dtype)
 
         self.model.grid_resolution = self.grid_resolution_for(gaussians.num_gaussians)
         features = None
         with self._capture.attached() if self.mask_head else nullcontext():
-            with _muted(self.quiet):
+            with _muted(self.quiet), self._order_generator():
                 # The model works on batches of scenes, we do one at a time
                 refined = self.model(batch_normalized_gs=[gs], batch_scene_idx=[0])[0]
+            residual_scale = self.residual_scale_for(field_gaussians or gaussians.num_gaussians)
+            if residual_scale != 1.0:
+                refined = self._scale_residual(
+                    {key: gs[key] for key in refined}, refined, residual_scale
+                )
             if self.mask_head:
                 features = self._capture.take(gaussians.num_gaussians)
 

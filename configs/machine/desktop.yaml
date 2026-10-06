@@ -43,4 +43,11 @@ device_offload_reconstructor_above: 300_000
 device_memory_per_million_gaussians_gib: 15.0
 device_memory_per_million_gaussians_per_view_gib: 0.18
 device_memory_view_reference_pixels: 200_704
+# What the LPIPS term (optim.lpips_loss_weight > 0) holds for its
+# backward per supervised view of the reference resolution, whatever the
+# Gaussians: VGG's activations, 0.125 GiB at 224x224 and so 0.5 at
+# 448x448, measured 2026-10-02. Left out of the estimate, an 8-view
+# step (16 views supervised, ~8 GiB of it) was attempted in one graph
+# and ran out of memory on one step in seven.
+device_memory_lpips_per_view_gib: 0.5
 device_memory_safety_margin_gib: 1.0

@@ -24,6 +24,7 @@ import math
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -263,7 +264,8 @@ def estimate_single_graph_gib(cfg, num_gaussians: int, num_views: int, image_sha
     refiner's graph and backward per million Gaussians, plus the
     render's per million Gaussians per view, the latter scaled by the
     pixels of a view against the resolution the constant was measured
-    at (see device_memory_* in the machine config).
+    at (see device_memory_* in the machine config), plus, with the
+    LPIPS term on, what its network holds per view, at any size.
     """
     resident = torch.cuda.memory_allocated() / 2 ** 30
     pixels = image_shape[0] * image_shape[1] / cfg.device_memory_view_reference_pixels
@@ -271,7 +273,11 @@ def estimate_single_graph_gib(cfg, num_gaussians: int, num_views: int, image_sha
         cfg.device_memory_per_million_gaussians_gib
         + num_views * pixels * cfg.device_memory_per_million_gaussians_per_view_gib
     )
-    return resident + per_million * num_gaussians / 1e6
+    lpips = (
+        num_views * pixels * cfg.device_memory_lpips_per_view_gib
+        if cfg.optim.lpips_loss_weight > 0 else 0.0
+    )
+    return resident + per_million * num_gaussians / 1e6 + lpips
 
 
 def single_graph_fits(cfg, num_gaussians: int, num_views: int, image_shape) -> Tuple[bool, float, float]:
@@ -495,7 +501,8 @@ def training_step(
             cfg, splatformer, rule, reconstruction.gaussians, score, reconstruction.context, generator,
         )
 
-    refined, logits = refine(cfg, splatformer, reconstruction.gaussians, score)
+    # Scaled by the size of the prediction, not of what a retry cut it to
+    refined, logits = refine(cfg, splatformer, reconstruction.gaussians, score, field_gaussians=predicted)
     if stages == 1:
         pruned = apply_rule(rule, refined, logits, noisy=True)
         rendered, _ = pruned.trained.rasterize(
@@ -689,6 +696,46 @@ def draw_pruner(pruners: Sequence[Pruner], generator: Generator) -> Pruner:
     return pruners[torch.randint(len(pruners), (1,), generator=generator).item()]
 
 
+class WeightAverage:
+    """
+    An exponential moving average of a model's floating-point weights,
+    which is what validates and is saved when it is on: on held-out
+    dense fields the whole residual of the last iterate overshoots
+    (half of it beat all of it at 16 views, 2026-09-30), the mark of
+    an estimate that varies more than it should, which averaging the
+    iterates is the standard way to calm. Its decay warms up as
+    (1 + t) / (10 + t), so that the first steps do not drag the weights
+    a fine-tune starts from along for hundreds of steps.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float):
+        assert 0.0 < decay < 1.0, f"An average's decay lies in (0, 1), got {decay}"
+        self.decay = decay
+        self.updates = 0
+        self.shadow = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+            if value.dtype.is_floating_point
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        self.updates += 1
+        decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        for key, value in model.state_dict().items():
+            if key in self.shadow:
+                self.shadow[key].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+
+    @contextmanager
+    def applied(self, model: torch.nn.Module):
+        """The model holds the average inside, its own weights again on the way out."""
+        held = {key: value.detach().clone() for key, value in model.state_dict().items() if key in self.shadow}
+        model.load_state_dict(self.shadow, strict=False)
+        try:
+            yield
+        finally:
+            model.load_state_dict(held, strict=False)
+
+
 def recover_from_oom(optimizer, scaler):
     """
     Put the optimizer and the loss scaler back into a state a fresh
@@ -842,16 +889,18 @@ def refine(
     gaussians: Gaussians,
     score: Optional[Tensor] = None,
     enable_amp: Optional[bool] = None,
+    field_gaussians: Optional[int] = None,
 ) -> Tuple[Gaussians, Optional[Tensor]]:
     """
     Run SplatFormer over a set of Gaussians, in half precision if asked,
     returning the refined set and the mask logits when it has a mask
-    head.
+    head. 'field_gaussians' is the size of the prediction they were cut
+    from, which sets the residual scale (SplatFormer.residual_scale_for).
     """
     with torch.cuda.amp.autocast(
         enabled=cfg.optim.enable_amp if enable_amp is None else enable_amp
     ):
-        return splatformer.refine(gaussians, score)
+        return splatformer.refine(gaussians, score, field_gaussians=field_gaussians)
 
 
 def control_at(cfg, gaussians: Gaussians, score: Tensor, count: int) -> Gaussians:
@@ -1129,7 +1178,8 @@ def validate(
                 # takes a different path once a module leaves training
                 # mode, and it has no half-precision kernel to offer there
                 refined, logits = refine(
-                    cfg, splatformer, thinned, kept_score, enable_amp=False
+                    cfg, splatformer, thinned, kept_score, enable_amp=False,
+                    field_gaussians=reconstruction.gaussians.num_gaussians,
                 )
                 # What inference delivers: the plain sigmoid's level set,
                 # with no Gumbel noise
@@ -1453,6 +1503,9 @@ def main(cfg):
         importance_eps=cfg.pruning.learned.importance_eps,
         grid_reference_gaussians=cfg.splatformer.grid_reference_gaussians,
         grid_exponent=cfg.splatformer.grid_exponent,
+        residual_reference_gaussians=cfg.splatformer.residual_reference_gaussians,
+        residual_exponent=cfg.splatformer.residual_exponent,
+        importance_size_reference=cfg.pruning.learned.importance_size_reference,
     ).to(device)
     splatformer.train()
     trainable = sum(p.numel() for p in splatformer.parameters() if p.requires_grad)
@@ -1517,6 +1570,11 @@ def main(cfg):
         optimizer, schedule=cfg.optim.lr_schedule, total_step=cfg.optim.total_steps
     )
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.optim.enable_amp)
+    average = (
+        WeightAverage(splatformer.model, cfg.optim.ema_decay) if cfg.optim.ema_decay else None
+    )
+    # Validation and checkpoints read the average when there is one
+    averaged = lambda: average.applied(splatformer.model) if average is not None else nullcontext()
 
     run = wandb.init(
         project=cfg.wandb.project,
@@ -1645,10 +1703,11 @@ def main(cfg):
             step == 0 and cfg.validation.skip_initial
         ):
             tqdm.write(f"Validating at step {step}...")
-            run_validation(
-                cfg, splatformer, reconstructor, dataset, validation_scenes,
-                step, pruners, rule,
-            )
+            with averaged():
+                run_validation(
+                    cfg, splatformer, reconstructor, dataset, validation_scenes,
+                    step, pruners, rule,
+                )
 
         no_room = False
         try:
@@ -1747,6 +1806,8 @@ def main(cfg):
         if loss_histogram is not None:
             loss_histogram.record(reconstruction.gaussians.num_gaussians, loss)
         scheduler.step()
+        if average is not None:
+            average.update(splatformer.model)
 
         if step % cfg.log.interval == 0:
             with torch.no_grad():
@@ -1879,7 +1940,8 @@ def main(cfg):
 
         if (step + 1) % cfg.log.save_interval == 0:
             path = checkpoint_dir / f"model_{step + 1:08d}.pth"
-            torch.save(splatformer.model.state_dict(), path)
+            with averaged():
+                torch.save(splatformer.model.state_dict(), path)
             tqdm.write(f"Wrote {path}")
 
         del step_result, reconstruction, views, rendered, pruned
@@ -1900,11 +1962,15 @@ def main(cfg):
             f"mean of {loss_histogram.mean:.4f} over the run:\n"
             + loss_histogram.summary()
         )
-    run_validation(
-        cfg, splatformer, reconstructor, dataset, validation_scenes,
-        cfg.optim.total_steps, pruners, rule,
-    )
-    torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final.pth")
+    if average is not None:
+        # The last iterate too, next to the average that model_final.pth holds
+        torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final_last.pth")
+    with averaged():
+        run_validation(
+            cfg, splatformer, reconstructor, dataset, validation_scenes,
+            cfg.optim.total_steps, pruners, rule,
+        )
+        torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final.pth")
     wandb.finish()
 
 

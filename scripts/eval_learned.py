@@ -127,6 +127,9 @@ DEVICE_MAX_INTERSECTIONS = 100_000_000
 PRUNING_BATCHES_PER_PASS = 32
 RECONSTRUCTOR = "YoNoSplat"
 REFINER_BATCH_STATISTICS = True
+# The same refined field and logits for the same input, whatever ran
+# before (SplatFormer's 'deterministic'; 2026-10-04)
+REFINER_DETERMINISTIC = True
 
 # --- The learned rule, as configs/train.yaml has it ---
 IMPORTANCE_REFERENCE = 0.01
@@ -145,6 +148,17 @@ THRESHOLD = IMPORTANCE_REFERENCE
 # same count as RadSplat's 0.01
 LEARNED_CHECKPOINT = CHECKPOINTS_DIR / "anyprune" / "learned-mask-2-16v-deg2.0-speedy.pth"
 SPEEDY_IMPORTANCE_REFERENCE = 0.0125
+# How every mask refiner is run, chosen on the validation split for the
+# one trained at 2-16 views (2026-10-04): it applies only
+# min(1, (100,352 / N) ** 0.3333) of the adjustment it predicts on a
+# field of N Gaussians (100,352 is two views), and reads its score as
+# S * N / 100,352. The second leaves its order of the Gaussians as it is
+# (a constant on an input the batch statistics centre) and only moves
+# its own cut, which keeps 50% at 2 views and 31% at 64 instead of 50%
+# and 16%. configs/train.yaml's splatformer.residual_*
+# and pruning.learned.importance_size_reference, at evaluation.
+RESIDUAL_RULE = (100_352, 0.3333)
+IMPORTANCE_SIZE_REFERENCE = 100_352
 # The same recipe reading the RadSplat score (pruning.learned.score),
 # 0.2-1.4 dB under it (2026-09-22)
 RADSPLAT_LEARNED_CHECKPOINT = CHECKPOINTS_DIR / "anyprune" / "learned-mask-2-16v-deg2.0-input-p2.0.pth"
@@ -312,11 +326,17 @@ def build_rule(compensate: bool) -> LearnedRule:
 def build_refiner(
     checkpoint: Path, device: torch.device, mask_head: bool, importance: bool,
     reference: float = IMPORTANCE_REFERENCE,
+    residual_rule: Optional[Sequence[float]] = RESIDUAL_RULE,
+    size_reference: Optional[float] = IMPORTANCE_SIZE_REFERENCE,
 ) -> SplatFormer:
+    """None for residual_rule applies the whole adjustment, None for size_reference reads the score as it is."""
+    reference_gaussians, exponent = residual_rule if residual_rule is not None else (None, 1.0 / 3.0)
     return SplatFormer(
         str(checkpoint), quiet=True, batch_statistics=REFINER_BATCH_STATISTICS,
         importance_input=importance, mask_head=mask_head,
         importance_reference=reference, importance_eps=IMPORTANCE_EPS,
+        residual_reference_gaussians=reference_gaussians, residual_exponent=exponent,
+        importance_size_reference=size_reference, deterministic=REFINER_DETERMINISTIC,
     ).to(device).eval()
 
 
@@ -708,7 +728,8 @@ def main():
         if not path.exists():
             print(f"Skipping {method_topk(score, SUFFIX_REFINED)!r}: no checkpoint at {path}")
             continue
-        topk_refiners[score] = build_refiner(path, device, mask_head=False, importance=False)
+        topk_refiners[score] = build_refiner(path, device, mask_head=False, importance=False,
+                                              residual_rule=None, size_reference=None)
         checkpoints[method_topk(score, SUFFIX_REFINED)] = str(path)
     reconstructor = build_reconstructor(RECONSTRUCTOR, ANYSPLAT_CHECKPOINT, YONOSPLAT_CHECKPOINT).to(device)
     scorer = Scorer()

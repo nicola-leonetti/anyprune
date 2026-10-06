@@ -71,16 +71,15 @@ METHODS = {
     ANYPRUNE: ("AnyPrune (mask logits + refiner)", SERIES_COLORS[2], "h", "-"),
     "anyprune-logits": ("AnyPrune logits, raw", SERIES_COLORS[2], "h", ":"),
     ANYPRUNE_OWN: ("AnyPrune own rule (logit > 0)", "#0b6b4a", "*", "none"),
-    # The same model before the rotation-frame fix of 2026-09-29, when
-    # one is drawn next to it
-    "anyprune-prev": ("AnyPrune before the rotation fix", "#8fd6bb", None, "--"),
     # The same forward with the refiner's whole residual, next to a curve
     # that scales it down by the field's size (--also-full)
     "anyprune-whole": ("AnyPrune, whole residual", "#8fd6bb", "h", "--"),
+    # The model without the LPIPS term, next to one trained with it
+    "anyprune-nolpips": ("AnyPrune without LPIPS (current final)", "#0b6b4a", "h", "--"),
     **{score: (*E.SCORES[score], marker, "-") for score, marker in MARKERS.items()},
     REFERENCE: ("Uniform (random)", REFERENCE_COLOR, None, "--"),
 }
-OWN_FULL = {ANYPRUNE, "anyprune-prev", "anyprune-whole"}
+OWN_FULL = {ANYPRUNE, "anyprune-whole", "anyprune-nolpips"}
 METRICS = (("psnr", "PSNR (dB) ↑"), ("ssim", "SSIM ↑"), ("lpips", "LPIPS ↓"))
 BLOCKS = {"nvs": "novel view synthesis (test views)", "self": "self-reconstruction (context views)"}
 # How many paired standard errors a difference has to clear to count
