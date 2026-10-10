@@ -1,0 +1,161 @@
+# The whole benchmark of scripts/evaluate_all.py: every pruning score and AnyPrune, on every reconstructor
+# and dataset below, cut to the same fixed shares of the same predicted fields. Any key can be overridden
+# from the command line as key=value (OmegaConf dot-list), e.g.
+#
+#   python scripts/evaluate_all.py datasets.dl3dv.root=/data/dl3dv device.max_views_per_render=8
+#
+# Paths that are relative are read from the repository root.
+
+output_dir: outputs/evaluate-all
+
+# The protocol of every benchmark so far (eval_learned.py / eval_fractions*.py): a 2 * 64 = 128-frame
+# window per scene drawn with seed + scene index, context and test frames alternating, the first 'views'
+# of each; every score measured over all the context views; the metrics rendered on at most
+# max_scored_views of each half, evenly spaced (a no-op up to 16 views)
+protocol:
+  seed: 42
+  window: 128
+  fractions: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  max_scored_views: 16
+  deterministic: true
+
+# The pre-existing pruning scores (eval_learned.SCORES) and the uniform draw, each cut raw (no
+# compensation, no fine-tuning). A score that does not fit on the card is skipped for that cell alone
+baselines: [uniform, radsplat, speedy-splat, pup, mini-splatting, lightgaussian, refine, gaussianpop]
+
+datasets:
+  dl3dv:
+    label: DL3DV test
+    root: /home/nicola/Desktop/Anysplat-improved/datasets/dl3dv
+    images_subdir: images_8
+    split: test          # the repo's 80/10/10 split (seed 0): 54 test scenes
+    num_scenes: null     # all of them
+  zeroshot:
+    # Mip-NeRF 360 (8 scenes) + Tanks and Temples (6) + Deep Blending (2), never trained on, in DL3DV's
+    # layout with frames ordered along a camera chain and brought to DL3DV's images_8 resolution
+    # (short side 270). Unpack zeroshot-270.tar wherever and point root at it
+    label: Mip-NeRF 360 + T&T + Deep Blending (zero-shot)
+    root: /home/nicola/Desktop/Anysplat-improved/datasets/zeroshot
+    images_subdir: images_270
+    split: null          # every scene
+    num_scenes: null
+  # The test splits of RealEstate10K and ACID (pixelSplat's chunks, lhmd/re10k_torch and lhmd/acid_torch),
+  # written by scripts/torch_chunks_to_dl3dv.py: every 13th frame of the clips with at least 196 frames, so
+  # 8 context views span ReSplat's 200-frame multi-view setting; 2-8 views. No scene key is in the train split
+  re10k:
+    label: RealEstate10K test
+    root: /home/nicola/Desktop/Anysplat-improved/datasets/re10k
+    # 32 views (64 alternating frames) do not fit these clips at stride 13: at 16-32 views, every 4th
+    # frame of the clips with at least 253 frames (64 frames span 253 source frames)
+    root_by_views:
+      16: /home/nicola/Desktop/Anysplat-improved/datasets/re10k-stride4
+      24: /home/nicola/Desktop/Anysplat-improved/datasets/re10k-stride4
+      32: /home/nicola/Desktop/Anysplat-improved/datasets/re10k-stride4
+    images_subdir: images_270
+    split: null
+    num_scenes: null
+  acid:
+    label: ACID test
+    root: /home/nicola/Desktop/Anysplat-improved/datasets/acid
+    root_by_views:
+      16: /home/nicola/Desktop/Anysplat-improved/datasets/acid-stride4
+      24: /home/nicola/Desktop/Anysplat-improved/datasets/acid-stride4
+      32: /home/nicola/Desktop/Anysplat-improved/datasets/acid-stride4
+    images_subdir: images_270
+    split: null
+    num_scenes: null
+
+# Which datasets each reconstructor runs on, at which view counts, and which AnyPrune models prune its
+# fields. 'views' stops where the reconstructor's own paper stops:
+#   YoNoSplat  trained on 2-32 views, evaluated up to 128 (ScanNet++ 32/64/128); we stop at 32
+#   AnySplat   evaluated sparse 3/6/16 and dense 32/48/64; we stop at 32
+#   ReSplat    one DL3DV checkpoint per count: 8, 16 and 32 views (the 8-view one below 8)
+#   VolSplat   RealEstate10K/ACID at 6 views
+# AnyPrune models: 'residual_rule' [REFERENCE, EXPONENT] applies min(1, (REFERENCE / N) ** EXPONENT) of
+# the refiner's residual on a field of N Gaussians (null: the whole residual); 'also_whole' adds the same
+# forward with the whole residual as <name>-whole; 'size_reference' is the scale-free cut of the YoNoSplat
+# model (it only moves the own logit > 0 cut).
+reconstructors:
+  YoNoSplat:
+    checkpoint: botaoye/YoNoSplat/dl3dv_224x224_ctx2to32.ckpt
+    datasets: [dl3dv, zeroshot, re10k, acid]
+    views: [2, 4, 8, 16, 24, 32]
+    anyprune:
+      - name: anyprune
+        checkpoint: checkpoints/anyprune/final/anyprune-yonosplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: 100352
+        also_whole: false
+  ReSplat:
+    checkpoint: haofeixu/resplat/resplat-base-dl3dv-256x448-view8-1934a04c.pth
+    checkpoint_by_views:
+      16: haofeixu/resplat/resplat-base-dl3dv-256x448-view16-f38bf984.pth
+      32: haofeixu/resplat/resplat-base-dl3dv-256x448-view32-439b63a6.pth
+    datasets: [dl3dv, zeroshot, re10k, acid]
+    views: [2, 4, 8, 16, 32]
+    anyprune:
+      - name: anyprune
+        checkpoint: checkpoints/anyprune/final/anyprune-resplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: null
+        also_whole: true
+      # The YoNoSplat-trained model applied as is (zero-shot across reconstructors)
+      - name: anyprune-zeroshot
+        checkpoint: checkpoints/anyprune/final/anyprune-yonosplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: 100352
+        also_whole: false
+  VolSplat:
+    checkpoint: lhmd/VolSplat/volsplat-re10k-256x256.ckpt
+    datasets: [dl3dv, zeroshot, re10k, acid]
+    views: [2, 4, 6]
+    anyprune:
+      - name: anyprune
+        checkpoint: checkpoints/anyprune/final/anyprune-volsplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: null
+        also_whole: true
+      # The YoNoSplat-trained model applied as is (zero-shot across reconstructors)
+      - name: anyprune-zeroshot
+        checkpoint: checkpoints/anyprune/final/anyprune-yonosplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: 100352
+        also_whole: false
+  AnySplat-voxelized:
+    checkpoint: lhjiang/anysplat
+    datasets: [dl3dv, zeroshot, re10k, acid]
+    views: [2, 4, 8, 16, 32]
+    anyprune:
+      # Trained with mask weight 0.033 (the YoNoSplat recipe's 0.0083 kept ~all of AnySplat's dense
+      # fields); read with the whole residual, which the YoNoSplat rule shrinks to 0.5-0.7 and costs 5-6 dB
+      - name: anyprune
+        checkpoint: checkpoints/anyprune/final/anyprune-anysplat.pth
+        residual_rule: null
+        size_reference: null
+        also_whole: false
+      # The YoNoSplat-trained model applied as is (zero-shot across reconstructors)
+      - name: anyprune-zeroshot
+        checkpoint: checkpoints/anyprune/final/anyprune-yonosplat.pth
+        residual_rule: [100352, 0.3333]
+        size_reference: 100352
+        also_whole: false
+
+# Which reconstructors and datasets to run, in this order (YoNoSplat first: it is the main result)
+run:
+  reconstructors: [YoNoSplat, ReSplat, VolSplat]   # AnySplat-voxelized: left out for now
+  datasets: [dl3dv, re10k, acid]   # zeroshot (Mip-NeRF 360 + T&T + DB): sparse captures, left out
+  views: null            # null: each reconstructor's own list; or a list to intersect it with
+  models: null           # null: every AnyPrune model of each reconstructor; or the names to evaluate
+
+device:
+  # How many views gsplat rasterizes at once, and the tile intersections past which a view is drawn in
+  # runs of depth: raise both on a larger card (the 16 GiB desktop: 2 and 1e8)
+  max_views_per_render: 2
+  max_intersections: 100_000_000
+  pruning_batches_per_pass: 32
+  # A field above this many Gaussians moves the reconstructor's weights off the card while it is scored,
+  # refined and rendered
+  offload_reconstructor_above: 850_000
+  # When a field does not fit one refiner forward, refine it in spatial cores of at most this many
+  # Gaussians, each with a halo (null: skip AnyPrune for that cell instead)
+  refine_chunk_gaussians: 600_000

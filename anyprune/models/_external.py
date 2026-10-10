@@ -3,8 +3,8 @@ Context manager used to import from more than one external model
 codebase.
 
 The codebases under external/ are not written to live side by side:
-AnySplat and YoNoSplat are both laid out as a top-level 'src' package
-and both import their own files by that name, while SplatFormer claims
+AnySplat, YoNoSplat, ReSplat and VolSplat are all laid out as a top-level 'src' package
+and all import their own files by that name, while SplatFormer claims
 the equally generic 'models', 'utils' and 'dataset'. Only one repository
 can answer to a given name at a time.
 To solve that, owns() lends its top-level names to one repository for as
@@ -30,6 +30,8 @@ EXTERNAL_ROOT = Path(__file__).resolve().parent / "external"
 _TOP_LEVEL_PACKAGES: dict[str, Tuple[str, ...]] = {
     "AnySplat": ("src",),
     "YoNoSplat": ("src",),
+    "ReSplat": ("src",),
+    "VolSplat": ("src",),
     "SplatFormer": ("models", "utils", "dataset"),
     "LightGaussian": (
         "arguments", "gaussian_renderer", "lpipsPyTorch", "prune", "scene",
@@ -112,6 +114,49 @@ def stub_unbuilt_extensions(*names: str):
             sys.modules[name] = _UnbuiltExtension(name)
 
 
+@contextmanager
+def standing_in(name: str, module: ModuleType) -> Iterator[None]:
+    """
+    Answer imports of the top-level module 'name' with 'module' for as
+    long as the block runs, and put back whatever answered before.
+
+    For a codebase that imports a compiled extension at module level
+    and only needs a few of its functions, which 'module' provides: the
+    codebase keeps the reference it bound while importing, and the
+    others go on seeing what they saw.
+    """
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        yield
+    finally:
+        if previous is None:
+            del sys.modules[name]
+        else:
+            sys.modules[name] = previous
+
+
+def unshadow_minkowski_engine():
+    """
+    Import MinkowskiEngine, if it is installed, and take back off
+    sys.path the directory it appends to it.
+
+    It puts its own directory on the path to import its files by their
+    bare names, and that directory holds a regular package called
+    'utils', which then wins over LightGaussian's 'utils', a namespace
+    package (no __init__.py), wherever the two sit on the path. Its files
+    are all imported by then, so the names it looks up later are found
+    in sys.modules. Pointcept imports it whenever it is installed, so
+    this has to run before SplatFormer is imported.
+    """
+    try:
+        import MinkowskiEngine
+    except ImportError:
+        return
+    directory = str(Path(MinkowskiEngine.__file__).resolve().parent)
+    sys.path[:] = [entry for entry in sys.path if str(Path(entry).resolve()) != directory]
+
+
 def shim_torch_attention():
     """
     Provide torch.nn.attention on the versions of PyTorch that predate
@@ -174,5 +219,7 @@ __all__ = [
     "EXTERNAL_ROOT",
     "owns",
     "shim_torch_attention",
+    "standing_in",
     "stub_unbuilt_extensions",
+    "unshadow_minkowski_engine",
 ]

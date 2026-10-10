@@ -132,6 +132,10 @@ def reconstruct(
     The predicted intrinsics are used for both,
     even though the dataset's are the more accurate ones, because those
     do not agree with the recovered frame and cost a lot of PSNR.
+
+    A posed reconstructor ('needs_cameras', ReSplat) is handed the
+    dataset's cameras of the context views and gives them back in its
+    own frame, and the same applies.
     """
     images = scene["images"]
     poses = scene["poses"].reshape(-1, 4, 4)
@@ -139,7 +143,16 @@ def reconstruct(
     context_images = images[context_idx]
     if context_downscale > 1:
         context_images = _downscale(context_images, context_downscale)
-    pred_poses, pred_intrinsics, gaussians = reconstructor(context_images)
+    if getattr(reconstructor, "needs_cameras", False):
+        assert context_downscale == 1, (
+            "The cameras of downscaled context views are not implemented"
+        )
+        pred_poses, pred_intrinsics, gaussians = reconstructor(
+            context_images, poses[context_idx],
+            scene["intrinsics"].reshape(-1, 3, 3)[context_idx],
+        )
+    else:
+        pred_poses, pred_intrinsics, gaussians = reconstructor(context_images)
     if context_downscale > 1:
         # Predicted in pixels of what the model was shown, needed in
         # pixels of the images everything is scored against

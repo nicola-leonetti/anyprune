@@ -205,6 +205,7 @@ def main():
     parser.add_argument("--with", dest="merged", type=Path, nargs="*", default=[],
                         help="runs whose cells are measured on the same fields, merged in by (views, scene)")
     parser.add_argument("--out", type=Path, default=None, help="where to write; the run directory by default")
+    parser.add_argument("--dataset", default="DL3DV test", help="what the titles name the scenes as")
     args = parser.parse_args()
     out = args.out or args.run
     out.mkdir(parents=True, exist_ok=True)
@@ -223,7 +224,7 @@ def main():
 
     pareto = {}
     for block, name in BLOCKS.items():
-        title = f"{name.capitalize()}, DL3DV test ({num_scenes} scenes)"
+        title = f"{name.capitalize()}, {args.dataset} ({num_scenes} scenes)"
         save(plot_fraction_curves(summary, block, views_list, METHODS, title, METRICS, REFERENCE),
              out / f"{block}.png")
         dominated_by = dominance(cells, block, views_list)

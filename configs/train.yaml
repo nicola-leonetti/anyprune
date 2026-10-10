@@ -254,6 +254,14 @@ pruning:
 reconstructor:
   training: YoNoSplat
   validation: [YoNoSplat]
+  # Train on the fields of several reconstructors at once: each step draws
+  # one of these uniformly, then one of its own context view counts
+  # (context_views above is then unused), and charges the mask at its own
+  # mask_loss_weight when one is given (optim.mask_loss_weight otherwise).
+  # e.g. [{name: YoNoSplat, context_views: [2, 4, 8, 16]},
+  #       {name: VolSplat, context_views: [2, 4], mask_loss_weight: 0.033}]
+  # null trains on reconstructor.training alone.
+  mixture: null
 
 splatformer:
   checkpoint: ${checkpoints_dir}/splatformer/train-on-objaverse.pth
@@ -290,6 +298,13 @@ splatformer:
   # views (2026-10-01).
   residual_reference_gaussians: null
   residual_exponent: 0.3333
+  # Condition the refiner on features of the context views, lifted onto
+  # every Gaussian as the blending-weighted mean of what it covers in
+  # them (anyprune.models.image_features), and added to the embedding
+  # before PTv3 and to the first layer of every head, from zero: a list
+  # of sources among dino, resnet, rgb, rgb-error, resnet-error, or null
+  # for none. The backbones' PCA has to be fitted first (see the module).
+  image_features: null
 
 optim:
   total_steps: 1_500
@@ -306,6 +321,9 @@ optim:
     # The mask head starts fresh against heads that are already
     # trained, so it learns at its own rate
     mask: 1e-3
+    # The image conditioning (splatformer.image_features) starts fresh
+    # too, its readers at zero
+    image_condition: 3e-4
   lr_schedule: constant
   # Validate and save an exponential moving average of the weights at
   # this decay instead of the last iterate (scripts/train.py,

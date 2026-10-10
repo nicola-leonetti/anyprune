@@ -9,7 +9,7 @@ import gsplat
 import torch
 from torch import Generator, Tensor
 
-from ..models.utils import AnySplatGaussians, YoNoSplatGaussians
+from ..models.utils import AnySplatGaussians, ReSplatGaussians, YoNoSplatGaussians
 
 
 # The tile an image is cut into, which is the one gsplat is built around
@@ -38,7 +38,8 @@ def world_rotations(covariances: Tensor, scales: Tensor) -> Tensor:
     that predicted it and only its covariance in the world frame (its
     gaussian_adapter rotates R S S^T R^T by the camera's c2w), so the
     rotation it hands over disagrees with the covariance by that camera's
-    orientation, more the further the capture turns.
+    orientation, more the further the capture turns. ReSplat does the
+    same.
     """
     from .optimization import _matrix_to_quaternion
 
@@ -325,6 +326,22 @@ class Gaussians:
         )
         # Its rotations are in the frame of each Gaussian's camera, its
         # covariances in the world's (see world_rotations)
+        return cls(
+            means=gaussians.means[0],
+            covariances=gaussians.covariances[0],
+            harmonics=gaussians.harmonics[0],
+            opacities=gaussians.opacities[0],
+            scales=gaussians.scales[0],
+            rotations=world_rotations(gaussians.covariances[0], gaussians.scales[0]),
+        )
+
+    @classmethod
+    def from_resplat(cls, gaussians: ReSplatGaussians) -> "Gaussians":
+        assert gaussians.means.shape[0] == 1, (
+            f"Expected a single scene from ReSplat, got a batch of {gaussians.means.shape[0]}"
+        )
+        # Like YoNoSplat, its rotations are in the frame of each
+        # Gaussian's camera and its covariances in the world's
         return cls(
             means=gaussians.means[0],
             covariances=gaussians.covariances[0],

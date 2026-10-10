@@ -46,6 +46,7 @@ from anyprune.gaussians import (
     sensitivity_scores,
 )
 from anyprune.models import RECONSTRUCTORS, SplatFormer, build_reconstructor
+from anyprune.models.wrappers.splatformer import IMAGE_CONDITION
 from anyprune.models.utils import (
     build_splatformer_optimizer, build_splatformer_scheduler,
 )
@@ -179,7 +180,7 @@ def distillation_target(
     without the term).
     """
     with torch.no_grad():
-        refined, logits = refine(cfg, splatformer, gaussians, score)
+        refined, logits = refine(cfg, splatformer, gaussians, score, context=context)
         pruned = apply_rule(rule, refined, logits, noisy=False)
         keep = pruned.hard
         if int(keep.sum().item()) == 0:
@@ -403,6 +404,12 @@ def training_step(
     # Back on the card if the last step left it off (see below): no
     # move when it is already there
     reconstructor.to(scene["images"].device)
+    if splatformer.image_conditioned:
+        # The frozen image extractor (~0.4 GiB) waits off the card while the
+        # reconstructor runs: VolSplat's 4-view cost volume missed by 30 MB
+        # next to it (2026-10-10). image_features() puts it back.
+        splatformer._extractor.to("cpu")
+        torch.cuda.empty_cache()
     reconstruction = reconstruct(
         reconstructor, scene, context_idx, test_idx,
         generator=generator, context_downscale=cfg.context_downscale,
@@ -502,7 +509,10 @@ def training_step(
         )
 
     # Scaled by the size of the prediction, not of what a retry cut it to
-    refined, logits = refine(cfg, splatformer, reconstruction.gaussians, score, field_gaussians=predicted)
+    refined, logits = refine(
+        cfg, splatformer, reconstruction.gaussians, score, field_gaussians=predicted,
+        context=reconstruction.context,
+    )
     if stages == 1:
         pruned = apply_rule(rule, refined, logits, noisy=True)
         rendered, _ = pruned.trained.rasterize(
@@ -810,6 +820,9 @@ class StepPlan:
     context_idx: Tensor
     test_idx: Tensor
     budget_fraction: float
+    # The reconstructor of reconstructor.mixture the step was drawn for,
+    # None without a mixture
+    reconstructor: Optional[str] = None
 
 
 def draw_step(
@@ -823,8 +836,14 @@ def draw_step(
     share of the prediction it keeps.
     """
     scene_idx = scenes[torch.randint(len(scenes), (1,), generator=generator).item()]
+    mixture = cfg.reconstructor.get("mixture")
+    entry = None
+    if mixture:
+        # One reconstructor of the mixture drawn uniformly, then one of
+        # its own view counts
+        entry = mixture[torch.randint(len(mixture), (1,), generator=generator).item()]
     num_context_views = sample_num_context_views(
-        cfg.context_views, generator=generator
+        cfg.context_views if entry is None else entry.context_views, generator=generator
     )
     frames, context_idx, test_idx = plan_views(
         cfg, dataset, scene_idx, num_context_views, generator
@@ -837,6 +856,7 @@ def draw_step(
         budget_fraction=sample_budget_fraction(
             cfg.budget.min_fraction, cfg.budget.max_fraction, generator=generator
         ),
+        reconstructor=None if entry is None else entry.name,
     )
 
 
@@ -890,17 +910,22 @@ def refine(
     score: Optional[Tensor] = None,
     enable_amp: Optional[bool] = None,
     field_gaussians: Optional[int] = None,
+    context: Optional[ViewSet] = None,
 ) -> Tuple[Gaussians, Optional[Tensor]]:
     """
     Run SplatFormer over a set of Gaussians, in half precision if asked,
     returning the refined set and the mask logits when it has a mask
     head. 'field_gaussians' is the size of the prediction they were cut
     from, which sets the residual scale (SplatFormer.residual_scale_for).
+    'context' is the views they were reconstructed from, which an
+    image-conditioned network lifts its features from.
     """
     with torch.cuda.amp.autocast(
         enabled=cfg.optim.enable_amp if enable_amp is None else enable_amp
     ):
-        return splatformer.refine(gaussians, score, field_gaussians=field_gaussians)
+        return splatformer.refine(
+            gaussians, score, field_gaussians=field_gaussians, context=context,
+        )
 
 
 def control_at(cfg, gaussians: Gaussians, score: Tensor, count: int) -> Gaussians:
@@ -1180,6 +1205,7 @@ def validate(
                 refined, logits = refine(
                     cfg, splatformer, thinned, kept_score, enable_amp=False,
                     field_gaussians=reconstruction.gaussians.num_gaussians,
+                    context=reconstruction.context,
                 )
                 # What inference delivers: the plain sigmoid's level set,
                 # with no Gumbel noise
@@ -1474,6 +1500,28 @@ def main(cfg):
         cfg.reconstructor.training, cfg.anysplat_checkpoint,
         cfg.yonosplat_checkpoint,
     ).to(device)
+    # reconstructor.mixture: every step draws one of several frozen
+    # reconstructors, each with its own view counts (and mask weight); the
+    # ones a step does not use wait on the CPU. reconstructor.training is
+    # the one validation runs against.
+    mixture = cfg.reconstructor.get("mixture") or []
+    reconstructors = {cfg.reconstructor.training: reconstructor}
+    for entry in mixture:
+        if entry.name not in reconstructors:
+            print(f"Initializing frozen {entry.name} for the mixture...")
+            reconstructors[entry.name] = build_reconstructor(
+                entry.name, cfg.anysplat_checkpoint, cfg.yonosplat_checkpoint,
+            ).to("cpu")
+    on_card = [cfg.reconstructor.training]
+
+    def activate(name: str):
+        """The reconstructor of that name, on the card, with every other one off it."""
+        if on_card[0] != name:
+            reconstructors[on_card[0]].to("cpu")
+            torch.cuda.empty_cache()
+            reconstructors[name].to(device)
+            on_card[0] = name
+        return reconstructors[name]
 
     start = (
         "zeroed output heads" if cfg.splatformer.zero_output_heads
@@ -1483,6 +1531,8 @@ def main(cfg):
         name for name, wanted in (
             ("the importance score as an input channel", cfg.splatformer.importance_input),
             ("a mask head", cfg.splatformer.mask_head),
+            (f"image features ({', '.join(cfg.splatformer.image_features or [])})",
+             bool(cfg.splatformer.image_features)),
         ) if wanted
     ]
     print(
@@ -1506,6 +1556,7 @@ def main(cfg):
         residual_reference_gaussians=cfg.splatformer.residual_reference_gaussians,
         residual_exponent=cfg.splatformer.residual_exponent,
         importance_size_reference=cfg.pruning.learned.importance_size_reference,
+        image_features=cfg.splatformer.image_features,
     ).to(device)
     splatformer.train()
     trainable = sum(p.numel() for p in splatformer.parameters() if p.requires_grad)
@@ -1545,6 +1596,12 @@ def main(cfg):
         compensate=cfg.pruning.learned.compensate,
         compensation_exponent=cfg.compensation.exponent,
     )
+    # A mixture's reconstructors may each ask for their own mask weight
+    # (VolSplat's dense fields need 0.033 where YoNoSplat's take 0.0083)
+    rules = {
+        entry.name: replace(rule, mask_weight=entry.get("mask_loss_weight") or rule.mask_weight)
+        for entry in mixture
+    }
     controller = (
         QualityController(rule) if rule.mask and rule.quality_margin is not None else None
     )
@@ -1566,6 +1623,13 @@ def main(cfg):
         splatformer.model,
         lr_dict=OmegaConf.to_container(cfg.optim.learning_rates, resolve=True),
     )
+    if splatformer.image_conditioned:
+        # SplatFormer's own builder only knows the backbone and the heads;
+        # added before the scheduler, which gives every group its schedule
+        optimizer.add_param_group({
+            "params": getattr(splatformer.model, IMAGE_CONDITION).parameters(),
+            "lr": cfg.optim.learning_rates.image_condition,
+        })
     scheduler = build_splatformer_scheduler(
         optimizer, schedule=cfg.optim.lr_schedule, total_step=cfg.optim.total_steps
     )
@@ -1703,6 +1767,7 @@ def main(cfg):
             step == 0 and cfg.validation.skip_initial
         ):
             tqdm.write(f"Validating at step {step}...")
+            activate(cfg.reconstructor.training)
             with averaged():
                 run_validation(
                     cfg, splatformer, reconstructor, dataset, validation_scenes,
@@ -1735,6 +1800,9 @@ def main(cfg):
         context_idx, test_idx = plan.context_idx, plan.test_idx
         budget_fraction = plan.budget_fraction
         pruner = draw_pruner(pruners, generator)
+        step_reconstructor, step_rule = reconstructor, rule
+        if plan.reconstructor is not None:
+            step_reconstructor, step_rule = activate(plan.reconstructor), rules[plan.reconstructor]
 
         step_result = None
         # What a retry after an out-of-memory shrinks the step by,
@@ -1745,9 +1813,9 @@ def main(cfg):
             ran_out = False
             try:
                 step_result = training_step(
-                    cfg, splatformer, reconstructor, criterion, optimizer,
+                    cfg, splatformer, step_reconstructor, criterion, optimizer,
                     scaler, scene, context_idx, test_idx, budget_fraction,
-                    generator, pruner, rule, histogram=histogram,
+                    generator, pruner, step_rule, histogram=histogram,
                     loss_histogram=loss_histogram, budget_scale=budget_scale,
                     controller=controller,
                     rates=rates,
@@ -1928,6 +1996,7 @@ def main(cfg):
                 f"({budget_fraction:.1%} of the "
                 f"{predicted_gaussians:,} predicted){kept} "
                 f"from {context_views} context views"
+                + ("" if plan.reconstructor is None else f" of {plan.reconstructor}")
                 + ("" if len(pruners) == 1 else f" by {pruner.name}")
                 + f", supervised on {len(views)}"
                 + (
@@ -1965,6 +2034,7 @@ def main(cfg):
     if average is not None:
         # The last iterate too, next to the average that model_final.pth holds
         torch.save(splatformer.model.state_dict(), checkpoint_dir / "model_final_last.pth")
+    activate(cfg.reconstructor.training)
     with averaged():
         run_validation(
             cfg, splatformer, reconstructor, dataset, validation_scenes,

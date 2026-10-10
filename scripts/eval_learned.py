@@ -328,8 +328,12 @@ def build_refiner(
     reference: float = IMPORTANCE_REFERENCE,
     residual_rule: Optional[Sequence[float]] = RESIDUAL_RULE,
     size_reference: Optional[float] = IMPORTANCE_SIZE_REFERENCE,
+    image_features: Optional[Sequence[str]] = None,
 ) -> SplatFormer:
-    """None for residual_rule applies the whole adjustment, None for size_reference reads the score as it is."""
+    """
+    None for residual_rule applies the whole adjustment, None for size_reference reads the score as it is.
+    'image_features' are the sources an image-conditioned checkpoint was trained with (splatformer.image_features).
+    """
     reference_gaussians, exponent = residual_rule if residual_rule is not None else (None, 1.0 / 3.0)
     return SplatFormer(
         str(checkpoint), quiet=True, batch_statistics=REFINER_BATCH_STATISTICS,
@@ -337,6 +341,7 @@ def build_refiner(
         importance_reference=reference, importance_eps=IMPORTANCE_EPS,
         residual_reference_gaussians=reference_gaussians, residual_exponent=exponent,
         importance_size_reference=size_reference, deterministic=REFINER_DETERMINISTIC,
+        image_features=image_features,
     ).to(device).eval()
 
 

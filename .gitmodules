@@ -26,3 +26,6 @@
 [submodule "anyprune/models/external/ReSplat"]
 	path = anyprune/models/external/ReSplat
 	url = https://github.com/cvg/resplat.git
+[submodule "anyprune/models/external/VolSplat"]
+	path = anyprune/models/external/VolSplat
+	url = https://github.com/ziplab/VolSplat.git

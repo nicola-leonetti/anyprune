@@ -19,6 +19,12 @@ SH coefficients):
     what a Gumbel-Sigmoid turns into a keep mask (see
     anyprune.training.learned_pruning); it starts at zero, so the mask
     starts as a smooth version of the reference threshold.
+  - image conditioning: features of the context views lifted onto every
+    Gaussian (anyprune.models.image_features), encoded into a 64-channel
+    condition that is added to the backbone's embedding, before PTv3,
+    and to the first layer of every output head, the mask head's too.
+    Both readers start at zero, so a conditioned network also starts
+    where its checkpoint left it.
 
 To use the module for inference, it must be used in single precision 
 mode.
@@ -26,7 +32,7 @@ mode.
 import math
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterator, Optional, Sequence, Tuple
 
 import spconv.pytorch as spconv
 import torch
@@ -58,6 +64,33 @@ _MASK_HEAD_WIDTH = 128
 # What the point orders PTv3 shuffles on every forward are drawn from,
 # when the refiner runs deterministically
 _ORDER_SEED = 0
+# The image conditioning's module, among SplatFormer's, which is also the
+# key its learning rate is looked up under, and its width
+IMAGE_CONDITION = "image_condition"
+_CONDITION_WIDTH = 64
+_CONDITION_HIDDEN = 128
+
+
+def _image_condition(input_dim: int, embedding_dim: int, heads: Dict[str, int]) -> nn.ModuleDict:
+    """
+    The encoder of the lifted features (standardized per channel over
+    the field first, see _standardized), and the zero readers that add
+    its output to the embedding and to the first layer of every head.
+    """
+    readers = nn.ModuleDict({
+        name: nn.Linear(_CONDITION_WIDTH, width, bias=False) for name, width in heads.items()
+    })
+    embedding = nn.Linear(_CONDITION_WIDTH, embedding_dim, bias=False)
+    for reader in [embedding, *readers.values()]:
+        reader.weight.data.zero_()
+    return nn.ModuleDict({
+        "encoder": nn.Sequential(
+            nn.Linear(input_dim, _CONDITION_HIDDEN), nn.GELU(),
+            nn.Linear(_CONDITION_HIDDEN, _CONDITION_WIDTH),
+        ),
+        "embedding": embedding,
+        "heads": readers,
+    })
 
 
 def _widen_linear(linear: nn.Linear, extra: int) -> nn.Linear:
@@ -91,6 +124,20 @@ def _mask_head(input_dim: int, width: int = _MASK_HEAD_WIDTH) -> nn.Sequential:
     head[-1].weight.data.zero_()
     head[-1].bias.data.zero_()
     return head
+
+
+@torch.no_grad()
+def _standardized(features: Tensor) -> Tensor:
+    """
+    Every channel of the lifted features at zero mean and unit variance
+    over the field, as a BatchNorm on the field's own statistics would
+    have them (the way PTv3 normalizes its own input), but outside the
+    graph: the features are constants, and a 16-view field's are half a
+    GiB a copy, which a BatchNorm would keep two of for the backward.
+    """
+    features = features.float()
+    mean, std = features.mean(0), features.std(0)
+    return (features - mean) / std.clamp_min(1e-6)
 
 
 class _UniqueVoxelSubMConv3d(spconv.SubMConv3d):
@@ -221,6 +268,7 @@ class SplatFormer(nn.Module):
         residual_exponent: float = 1.0 / 3.0,
         importance_size_reference: Optional[float] = None,
         deterministic: bool = False,
+        image_features: Optional[Sequence[str]] = None,
     ):
         """
         'importance_input' and 'mask_head' are the two additions
@@ -253,6 +301,13 @@ class SplatFormer(nn.Module):
         on one point per voxel (_UniqueVoxelSubMConv3d). Off, the same
         field refines differently every time, by up to ~3 in a logit.
         For evaluation; training keeps both random.
+
+        'image_features' names the sources of the image conditioning
+        (anyprune.models.image_features.SOURCES), None for none: refine()
+        then has to be handed the context views. The extractor is frozen
+        and kept out of the state dict; the encoder and readers are in
+        it, and a checkpoint written without them loads with them at
+        their initialization.
         """
         super().__init__()
         self.quiet = quiet
@@ -282,6 +337,10 @@ class SplatFormer(nn.Module):
                 self._capture = _HeadInputCapture(
                     self.model.features_outputhead["opacities"], self._head_input_dim
                 )
+            self._extractor = None
+            self._condition = None
+            if image_features:
+                self._add_image_condition(image_features)
             if pretrained_ckpt is not None:
                 self._load_weights(pretrained_ckpt)
             if zero_output_heads:
@@ -443,6 +502,65 @@ class SplatFormer(nn.Module):
         for head in model.features_outputhead.values():
             head[0] = _widen_linear(head[0], 1)
 
+    def _add_image_condition(self, sources: Sequence[str]):
+        """
+        Build the frozen extractor and the conditioning module, and hook
+        the readers onto the embedding's linear layer and the first layer
+        of every head, each of which then adds its reader's output on the
+        condition of the forward in flight (_condition).
+
+        The extractor is kept out of the module tree on purpose: its
+        weights are not the refiner's to save or train, and its BatchNorm
+        layers must stay on their running averages whatever
+        batch_statistics does to the refiner's.
+        """
+        from ..image_features import ImageFeatures
+        extractor = ImageFeatures(sources)
+        object.__setattr__(self, "_extractor", extractor)
+        embedding = self.model.backbone.backbone.embedding[0]
+        heads = {name: head[0].out_features for name, head in self.model.features_outputhead.items()}
+        self.model.add_module(
+            IMAGE_CONDITION, _image_condition(extractor.channels, embedding.out_features, heads)
+        )
+        condition = getattr(self.model, IMAGE_CONDITION)
+
+        def adder(reader: nn.Linear):
+            def hook(module, args, output):
+                assert self._condition is not None, "A conditioned forward needs its condition"
+                assert self._condition.shape[0] == output.shape[0], (
+                    f"{self._condition.shape[0]:,} conditions for {output.shape[0]:,} Gaussians"
+                )
+                # In place: a linear layer's backward does not read its
+                # output, and a head's output on a 16-view field is
+                # 400 MB a copy at the card's edge
+                return output.add_(reader(self._condition.to(output.dtype)))
+            return hook
+
+        embedding.register_forward_hook(adder(condition["embedding"]))
+        for name, head in self.model.features_outputhead.items():
+            head[0].register_forward_hook(adder(condition["heads"][name]))
+
+    @property
+    def image_conditioned(self) -> bool:
+        return self._extractor is not None
+
+    def image_features(self, gaussians: Gaussians, context) -> Tensor:
+        """
+        (N, C) the lifted features of a field (image_features.ImageFeatures.lift)
+        over its context views, a ViewSet: what refine() computes when it
+        is not handed them, to be cut along with the field when it is
+        refined in parts.
+        """
+        assert self.image_conditioned, "This SplatFormer reads no image features"
+        self._extractor.to(gaussians.device)
+        with torch.cuda.amp.autocast(enabled=False):
+            features = self._extractor.lift(gaussians, context.images, context.poses, context.intrinsics)
+        # The sweep's buffers are gone, and the refiner's graph is next:
+        # handed back rather than left cached in the sizes the sweep cut
+        # them in (a 16-view step otherwise ran out with 3 GiB reserved)
+        torch.cuda.empty_cache()
+        return features
+
     def _fit_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """
         A checkpoint as this architecture can load it: one written
@@ -461,6 +579,13 @@ class SplatFormer(nn.Module):
                     )
         if self.mask_head:
             prefix = f"features_outputhead.{MASK_HEAD}."
+            if not any(key.startswith(prefix) for key in state_dict):
+                state_dict.update({
+                    key: value for key, value in self.model.state_dict().items()
+                    if key.startswith(prefix)
+                })
+        if self.image_conditioned:
+            prefix = f"{IMAGE_CONDITION}."
             if not any(key.startswith(prefix) for key in state_dict):
                 state_dict.update({
                     key: value for key, value in self.model.state_dict().items()
@@ -584,7 +709,8 @@ class SplatFormer(nn.Module):
 
     def refine(
         self, gaussians: Gaussians, score: Optional[Tensor] = None,
-        field_gaussians: Optional[int] = None,
+        field_gaussians: Optional[int] = None, context=None,
+        image_features: Optional[Tensor] = None,
     ) -> Tuple[Gaussians, Optional[Tensor]]:
         """
         Takes a set of Gaussians and returns the refined set, in the
@@ -603,11 +729,46 @@ class SplatFormer(nn.Module):
         residual_scale_for): a part of a dense field is as dense as the
         whole of it. By default, the size of what is handed over.
 
+        'context' is the ViewSet the field was reconstructed from, which
+        an image-conditioned network lifts its features from; or the
+        features themselves, 'image_features', lifted beforehand (see
+        image_features()), e.g. over the whole field this is a part of.
+
         The normalization into the unit cube that SplatFormer's voxel
         grid needs happens inside and is undone on the way out, which is
         what lets the caller keep working in the frame the Gaussians
         arrived in.
         """
+        if self.image_conditioned:
+            if image_features is None:
+                assert context is not None, (
+                    "This SplatFormer reads image features, refine() has to be handed the context views"
+                )
+                image_features = self.image_features(gaussians, context)
+            assert image_features.shape == (gaussians.num_gaussians, self._extractor.channels), (
+                f"Expected ({gaussians.num_gaussians:,}, {self._extractor.channels}) image features, "
+                f"got {tuple(image_features.shape)}"
+            )
+            encoder = getattr(self.model, IMAGE_CONDITION)["encoder"]
+            standardized = _standardized(image_features)
+            if torch.is_autocast_enabled():
+                standardized = standardized.half()
+            # Not held through the forward: only the standardized copy is read
+            image_features = None
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                # Its hidden layer recomputed in the backward rather than
+                # held, next to a 16-view field at the card's edge
+                self._condition = checkpoint(encoder, standardized, use_reentrant=False)
+            else:
+                self._condition = encoder(standardized)
+        try:
+            return self._refine(gaussians, score, field_gaussians)
+        finally:
+            self._condition = None
+
+    def _refine(
+        self, gaussians: Gaussians, score: Optional[Tensor], field_gaussians: Optional[int],
+    ) -> Tuple[Gaussians, Optional[Tensor]]:
         gs, scaler = self._to_parameters(gaussians)
         gs, unseen_harmonics = self._to_model_sh_degree(gs)
         importance = None
